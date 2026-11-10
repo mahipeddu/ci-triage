@@ -53,6 +53,7 @@ app.py        # Streamlit demo
 - Chunk extraction accuracy on LogChunks.
 - Ablations: BM25 vs dense vs hybrid; with/without normalization.
 - Time-based split (train on older failures, test on newer) — no random split, avoids leakage.
+- Shortcut check: inner-flaky records are all pytest tracebacks. Non-flaky test-level tracebacks (pytorch tests with no PASSED line in failed jobs) must be in the data too, extracted the same way. Report metrics per source (rerun, inner_rerun, disabled_issue, infra, regression) and per repo, not only overall.
 
 ## Milestones
 1. Collector + auto-labeling

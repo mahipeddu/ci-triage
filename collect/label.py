@@ -166,23 +166,56 @@ def reopen_times(number: int) -> list[datetime]:
         page += 1
 
 
-def disabled_issue(rec: dict, text: str, issues: dict, final_only: bool = True) -> dict | None:
-    """Bot DISABLED issue for a failing test, on a matching platform, created or reopened shortly after the job."""
+def disabled_for_test(rec: dict, test: str, cls: str, line: str, issues: dict) -> dict | None:
+    """Bot DISABLED issue for this test, on a matching platform, created or reopened shortly after the job."""
     t = ts(rec["job_started_at"])
 
     def in_window(anchor: datetime) -> bool:
         return anchor - DISABLED_BEFORE <= t <= anchor + DISABLED_AFTER
 
-    for (test, cls), line in failing_tests(text, final_only).items():
-        for iss in issue_candidates(test, cls, issues):
-            if not platform_match(iss["platforms"], rec["job_name"]):
-                continue
-            anchor = "created" if in_window(ts(iss["created_at"])) else \
-                     "reopened" if any(in_window(r) for r in reopen_times(iss["number"])) else None
-            if anchor:
-                return {"issue": iss["number"], "title": iss["title"], "platforms": iss["platforms"],
-                        "anchor": anchor, "log_line": line[:300]}
+    for iss in issue_candidates(test, cls, issues):
+        if not platform_match(iss["platforms"], rec["job_name"]):
+            continue
+        anchor = "created" if in_window(ts(iss["created_at"])) else \
+                 "reopened" if any(in_window(r) for r in reopen_times(iss["number"])) else None
+        if anchor:
+            return {"issue": iss["number"], "title": iss["title"], "platforms": iss["platforms"],
+                    "anchor": anchor, "log_line": line[:300]}
     return None
+
+
+def disabled_issue(rec: dict, text: str, issues: dict, final_only: bool = True) -> dict | None:
+    for (test, cls), line in failing_tests(text, final_only).items():
+        if d := disabled_for_test(rec, test, cls, line, issues):
+            return d
+    return None
+
+
+def test_failure_records(rec: dict, text: str, issues: dict) -> list[dict]:
+    """One record per test that failed in this (failed) pytorch job with no PASSED status line, in the same
+    format as pytorch_inner_flaky.py records. label is test-level evidence only (a DISABLED match);
+    the job's own label is kept as job_label."""
+    lines = text.splitlines()
+    out = []
+    for (test, cls), evs in testlog.scan(lines).items():
+        if not testlog.failed(evs) or testlog.passed(evs):
+            continue
+        first_fail = next(i for i, st, _ in evs if st == "fail")
+        fail_line = strip(lines[first_fail])
+        d = None if rec["label_source"] == "too_recent" else disabled_for_test(rec, test, cls, fail_line, issues)
+        out.append({
+            "repo": rec["repo"], "workflow_name": rec["workflow_name"], "run_id": rec["run_id"],
+            "attempt": rec["attempt"], "job_id": rec["job_id"], "job_name": rec["job_name"],
+            "job_conclusion": rec["job_conclusion"], "inner_flaky": False,
+            "head_sha": rec["head_sha"], "head_branch": rec["head_branch"],
+            "job_started_at": rec["job_started_at"], "html_url": rec["html_url"], "log_path": rec["log_path"],
+            "test_name": test, "test_class": cls, "fail_line": fail_line[:300], "pass_line": None,
+            "traceback": testlog.traceback_chunk(lines, (test, cls), evs),
+            "label": d and "flaky", "label_source": d and "disabled_issue", "confidence": d and "high",
+            "issue": d and d["issue"], "issue_test_match": bool(d),
+            "job_label": rec["label"], "job_label_source": rec["label_source"], "incident_id": rec["incident_id"],
+        })
+    return out
 
 
 def attempt_jobs(repo: str, run_id: int, n: int) -> dict[str, str]:
@@ -302,6 +335,8 @@ def main() -> None:
     ap.add_argument("--inp", type=Path, default=ROOT / "data/processed/failures.jsonl")
     ap.add_argument("--out", type=Path, default=ROOT / "data/processed/failures_labeled.jsonl")
     ap.add_argument("--disabled", type=Path, default=ROOT / "data/processed/pytorch_disabled.jsonl")
+    ap.add_argument("--tests-out", type=Path, default=ROOT / "data/processed/pytorch_test_failures.jsonl",
+                    help="per-test traceback records for failed pytorch jobs")
     ap.add_argument("--repos", nargs="*", help="only label these repos")
     ap.add_argument("--examples", type=int, default=5, help="infra example matches to print per pattern")
     args = ap.parse_args()
@@ -317,13 +352,19 @@ def main() -> None:
         recs = [r for r in recs if r["repo"] in args.repos]
     now = datetime.now(timezone.utc)
     out = []
-    with args.out.open("w") as f:
+    n_tests = 0
+    with args.out.open("w") as f, args.tests_out.open("w") as ft:
         for i, r in enumerate(recs, 1):
             out.append(label(r, issues, now))
             f.write(json.dumps(out[-1]) + "\n")
+            if r["repo"] == "pytorch/pytorch" and r["log_path"]:
+                for t in test_failure_records(out[-1], read_log(r["log_path"]), issues):
+                    ft.write(json.dumps(t) + "\n")
+                    n_tests += 1
             if i % 200 == 0 or i == len(recs):
                 print(f"{datetime.now():%H:%M:%S} labeled {i}/{len(recs)}", file=sys.stderr, flush=True)
 
+    print(f"wrote {n_tests} pytorch per-test failure records to {args.tests_out}", file=sys.stderr)
     print("== infra pattern matches (all jobs, before precedence / recency) ==")
     by_pat = defaultdict(list)
     for r in out:
