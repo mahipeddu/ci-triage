@@ -1,6 +1,9 @@
 """Auto-label failures per CLAUDE.md rules; unlabeled stays null.
 
-Precedence: flaky (DISABLED issue) > flaky (rerun) > infra (log patterns) > regression_strong / regression_weak.
+Precedence: flaky (DISABLED issue) > infra (log patterns) > flaky (rerun) > regression_strong > regression_weak.
+DISABLED issues count only if opened by pytorch-bot, their Platforms match the job, and the job started in
+[created - 7d, created + 1h] or [reopened - 7d, reopened + 1h] (pytorch skips the test once the issue is open,
+so the flaky failures that trigger the bot come before it).
 Runs newer than RECENT_DAYS stay unlabeled (reruns / fixes may still come).
 Usage: python -m collect.label
 """
@@ -11,9 +14,13 @@ import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
+from typing import Iterator
 
+from collect import testlog
 from collect.github_logs import FAILED, ROOT, gh_get, gh_pages, read_log
+from collect.testlog import strip
 
 RECENT_DAYS = 3
 FIX_WINDOW_DAYS = 14  # look for a fixing commit this long after the failure
@@ -44,11 +51,20 @@ INFRA = [(c, n, re.compile(p, re.I)) for c, n, p in [
     ("dependency_download", "rate_limited", r"rate limit exceeded|toomanyrequests|429 Too Many Requests"),
 ]]
 
-PYTEST_FAIL = re.compile(r"FAILED\s+(?:\[[\d.]+s\]\s+)?\S+?\.py::(?:(\w+)::)?(\w+)")
-UNITTEST_FAIL = re.compile(r"(?:FAIL|ERROR): (\w+) \(([\w.]+)\)")
+DISABLED_BOT = "pytorch-bot[bot]"
+DISABLED_BEFORE, DISABLED_AFTER = timedelta(days=7), timedelta(hours=1)
+# Semantics of torch/testing/_internal/common_utils.py check_if_enable: a disabled test is skipped if ANY listed
+# platform's condition holds (empty list = all). Conditions are runtime flags; approximated from the job name.
+# linux = sys.platform == "linux" (true on rocm/xpu linux runners); dynamo is implied by inductor.
+PLATFORM_RX = {p: re.compile(rx, re.I) for p, rx in {
+    "linux": r"linux", "mac": r"\bmac", "macos": r"\bmac", "win": r"\bwin", "windows": r"\bwin",
+    "rocm": r"rocm", "xpu": r"xpu", "asan": r"asan", "dynamo": r"dynamo|inductor", "inductor": r"inductor",
+    "slow": r"\bslow\b"}.items()}
+# remove_device_and_dtype_suffixes: issue "test_x (TestFoo)" also disables TestFooCUDA.test_x_cuda_float32
+DEVICE_SUFFIXES = {"cpu", "cuda", "meta", "mps", "xpu", "hpu", "lazy", "mtia", "privateuse1"}
+DTYPE_SUFFIXES = {"float16", "float32", "float64", "bfloat16", "complex32", "complex64", "complex128",
+                  "int8", "int16", "int32", "int64", "uint8", "bool"}
 
-TS = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ?")
-ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\[[0-9;]+m")
 UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 HEX = re.compile(r"\b0x[0-9a-f]+\b|\b(?=[0-9a-f]*\d)[0-9a-f]{7,64}\b", re.I)
 PATH = re.compile(r"(?:[A-Za-z]:)?[\w.+~-]*(?:[\\/][\w.+~-]+)+")
@@ -59,10 +75,6 @@ GENERIC = re.compile(r"exit code <n>|^##\[(end)?group\]")
 
 def ts(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def strip(line: str) -> str:
-    return ANSI.sub("", TS.sub("", line))
 
 
 def normalize(line: str) -> str:
@@ -115,19 +127,61 @@ def signature(rec: dict, region: list[str]) -> str:
     return "steps:" + "|".join(normalize(s) for s in rec["failed_steps"])
 
 
-def failing_tests(text: str) -> set[tuple[str, str]]:
-    """(test_name, class_name) pairs from pytest / unittest failure lines."""
-    out = {(m.group(2), m.group(1)) for m in PYTEST_FAIL.finditer(text) if m.group(1)}
-    out |= {(m.group(1), m.group(2).rsplit(".", 1)[-1]) for m in UNITTEST_FAIL.finditer(text)}
+def failing_tests(text: str, final_only: bool = True) -> dict[tuple[str, str], str]:
+    """(test_name, class_name) -> first failure log line. pytorch reruns failing tests inside the job;
+    final_only drops tests with any PASSED status line in the job (they did not cause this job's failure)."""
+    lines = text.splitlines()
+    out = {}
+    for key, evs in testlog.scan(lines).items():
+        if testlog.failed(evs) and not (final_only and testlog.passed(evs)):
+            out[key] = strip(lines[next(i for i, st, _ in evs if st == "fail")])
     return out
 
 
-def disabled_issue(rec: dict, text: str, issues: dict) -> int | None:
+def platform_match(platforms: list[str], job_name: str) -> bool:
+    valid = [p for p in platforms if p in PLATFORM_RX]  # unknown platforms are ignored, as in check_if_enable
+    return not valid or any(PLATFORM_RX[p].search(job_name) for p in valid)
+
+
+def sanitize_test(name: str) -> str:
+    parts = name.split("_")
+    if parts[-1] in DTYPE_SUFFIXES:
+        return "_".join(parts[:-2] if len(parts) > 1 and parts[-2] in DEVICE_SUFFIXES else parts[:-1])
+    return name
+
+
+def issue_candidates(test: str, cls: str, issues: dict) -> list[dict]:
+    """Bot issues whose title names this test, matched like check_if_enable (class prefix, sanitized name)."""
+    cands = issues.get(test, []) + (issues.get(sanitize_test(test), []) if sanitize_test(test) != test else [])
+    return [i for i in cands if i["author"] == DISABLED_BOT and cls.startswith(i["test_class"].rsplit(".", 1)[-1])]
+
+
+def reopen_times(number: int) -> list[datetime]:
+    out, page = [], 1
+    while True:
+        evs = gh_get(f"/repos/pytorch/pytorch/issues/{number}/events", {"per_page": 100, "page": page}) or []
+        out += [ts(e["created_at"]) for e in evs if e["event"] == "reopened"]
+        if len(evs) < 100:
+            return out
+        page += 1
+
+
+def disabled_issue(rec: dict, text: str, issues: dict, final_only: bool = True) -> dict | None:
+    """Bot DISABLED issue for a failing test, on a matching platform, created or reopened shortly after the job."""
     t = ts(rec["job_started_at"])
-    for key in failing_tests(text):
-        for iss in issues.get(key, []):
-            if ts(iss["created_at"]) <= t and (iss["closed_at"] is None or ts(iss["closed_at"]) > t):
-                return iss["number"]
+
+    def in_window(anchor: datetime) -> bool:
+        return anchor - DISABLED_BEFORE <= t <= anchor + DISABLED_AFTER
+
+    for (test, cls), line in failing_tests(text, final_only).items():
+        for iss in issue_candidates(test, cls, issues):
+            if not platform_match(iss["platforms"], rec["job_name"]):
+                continue
+            anchor = "created" if in_window(ts(iss["created_at"])) else \
+                     "reopened" if any(in_window(r) for r in reopen_times(iss["number"])) else None
+            if anchor:
+                return {"issue": iss["number"], "title": iss["title"], "platforms": iss["platforms"],
+                        "anchor": anchor, "log_line": line[:300]}
     return None
 
 
@@ -151,15 +205,22 @@ def failed_in_other_attempt(rec: dict) -> bool:
                for m in range(1, rec["max_attempt"] + 1) if m != rec["attempt"])
 
 
-def branch_runs(rec: dict, start: datetime, end: datetime) -> list[dict]:
-    """Completed runs of the same workflow / branch / head repo in [start, end], other commits, oldest first."""
-    closed = end < datetime.now(timezone.utc) - timedelta(days=1)
-    runs = gh_pages(f"/repos/{rec['repo']}/actions/workflows/{rec['workflow_id']}/runs", "workflow_runs",
-                    {"branch": rec["head_branch"], "status": "completed",
-                     "created": f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"}, cache=closed)
-    return sorted((r for r in runs if r["head_sha"] != rec["head_sha"]
-                   and (r.get("head_repository") or {}).get("full_name") == rec["head_repo"]),
-                  key=lambda r: r["created_at"])
+def branch_runs(rec: dict, forward: bool) -> Iterator[dict]:
+    """Completed runs of the same workflow / branch / head repo on other commits, moving away from the failure
+    (forward: later, oldest first; else earlier, newest first). Queried one day at a time because the list API
+    returns at most 1000 runs (newest first) per query, which would drop the closest runs on busy branches."""
+    t = ts(rec["run_created_at"])
+    for d in range(FIX_WINDOW_DAYS):
+        start, end = (t + timedelta(days=d), t + timedelta(days=d + 1)) if forward else \
+                     (t - timedelta(days=d + 1), t - timedelta(days=d))
+        closed = end < datetime.now(timezone.utc) - timedelta(days=1)
+        runs = gh_pages(f"/repos/{rec['repo']}/actions/workflows/{rec['workflow_id']}/runs", "workflow_runs",
+                        {"branch": rec["head_branch"], "status": "completed",
+                         "created": f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"}, cache=closed)
+        yield from sorted((r for r in runs if r["head_sha"] != rec["head_sha"]
+                           and (r.get("head_repository") or {}).get("full_name") == rec["head_repo"]
+                           and (ts(r["created_at"]) > t if forward else ts(r["created_at"]) < t)),
+                          key=lambda r: r["created_at"], reverse=not forward)
 
 
 def first_attempt_conclusion(rec: dict, run: dict) -> str | None:
@@ -169,9 +230,7 @@ def first_attempt_conclusion(rec: dict, run: dict) -> str | None:
 
 def prev_commit_failed(rec: dict) -> bool:
     """The closest earlier commit on the branch that ran this job also failed it."""
-    t = ts(rec["run_created_at"])
-    earlier = [r for r in branch_runs(rec, t - timedelta(days=FIX_WINDOW_DAYS), t) if ts(r["created_at"]) < t]
-    for r in reversed(earlier[-MAX_LATER_RUNS:]):
+    for r in islice(branch_runs(rec, forward=False), MAX_LATER_RUNS):
         c = first_attempt_conclusion(rec, r)
         if c is not None:
             return c in FAILED
@@ -197,10 +256,8 @@ def fix_diff(repo: str, bad: str, good: str) -> dict:
 
 def find_fix(rec: dict) -> tuple[dict | None, int]:
     """First later commit on the branch where the job passes, and how many later commits failed it first."""
-    t = ts(rec["run_created_at"])
-    later = [r for r in branch_runs(rec, t, t + timedelta(days=FIX_WINDOW_DAYS)) if ts(r["created_at"]) > t]
     seen_failed: set[str] = set()
-    for r in later[:MAX_LATER_RUNS]:
+    for r in islice(branch_runs(rec, forward=True), MAX_LATER_RUNS):
         c = first_attempt_conclusion(rec, r)
         if c == "success":
             return {"fix_sha": r["head_sha"], "fix_run_id": r["id"],
@@ -223,12 +280,12 @@ def label(rec: dict, issues: dict, now: datetime) -> dict:
 
     if ts(rec["run_created_at"]) > now - timedelta(days=RECENT_DAYS):
         return {**rec, "label_source": "too_recent"}
-    if rec["repo"] == "pytorch/pytorch" and (n := disabled_issue(rec, text, issues)):
-        return lab("flaky", "disabled_issue", {"issue": n})
-    if m := flaky_rerun(rec):
-        return lab("flaky", "rerun", {"passed_attempt": m})
+    if rec["repo"] == "pytorch/pytorch" and (d := disabled_issue(rec, text, issues)):
+        return lab("flaky", "disabled_issue", d)
     if infra:
         return lab("infra", "infra", {"category": infra[0], "pattern": infra[1]})
+    if m := flaky_rerun(rec):
+        return lab("flaky", "rerun", {"passed_attempt": m})
     fix, later_failed = find_fix(rec)
     if fix:
         prev_failed = prev_commit_failed(rec)
@@ -249,11 +306,11 @@ def main() -> None:
     ap.add_argument("--examples", type=int, default=5, help="infra example matches to print per pattern")
     args = ap.parse_args()
 
-    issues: dict[tuple[str, str], list[dict]] = {}
+    issues: dict[str, list[dict]] = {}  # test_name -> issues
     if args.disabled.exists():
         for line in args.disabled.open():
             i = json.loads(line)
-            issues.setdefault((i["test_name"], i["test_class"].rsplit(".", 1)[-1]), []).append(i)
+            issues.setdefault(i["test_name"], []).append(i)
 
     recs = [json.loads(l) for l in args.inp.open()]
     if args.repos:
@@ -264,8 +321,8 @@ def main() -> None:
         for i, r in enumerate(recs, 1):
             out.append(label(r, issues, now))
             f.write(json.dumps(out[-1]) + "\n")
-            print(f"labeled {i}/{len(recs)}", end="\r", file=sys.stderr)
-    print(file=sys.stderr)
+            if i % 200 == 0 or i == len(recs):
+                print(f"{datetime.now():%H:%M:%S} labeled {i}/{len(recs)}", file=sys.stderr, flush=True)
 
     print("== infra pattern matches (all jobs, before precedence / recency) ==")
     by_pat = defaultdict(list)

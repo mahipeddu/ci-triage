@@ -16,6 +16,8 @@ from typing import Iterator
 
 import requests
 
+from collect import testlog
+
 ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "data/raw"
 CACHE = RAW / "_cache"
@@ -26,6 +28,7 @@ REPOS = ["mpv-player/mpv", "AOMediaCodec/libavif", "apache/arrow",
          "pytest-dev/pytest", "pydantic/pydantic", "pytorch/pytorch"]
 WORKFLOWS = {"pytorch/pytorch": ["pull.yml", "trunk.yml"]}  # restricted repos; others: all workflows
 DEFAULT_CAP = {"pytorch/pytorch": 500}  # failed runs per workflow
+OTHER_CAP = 1000  # failed runs per repo for repos not in DEFAULT_CAP
 TRIM = {"pytorch/pytorch"}  # store failure windows only, not full logs
 FAILED = {"failure", "timed_out"}
 
@@ -63,12 +66,17 @@ def request(url: str, params: dict | None = None) -> requests.Response:
                 wait = max(int(r.headers["x-ratelimit-reset"]) - time.time(), 0)
             else:
                 wait = 60
-            print(f"  rate limited; sleeping {wait + 2:.0f}s", file=sys.stderr)
+            print(f"  {datetime.now():%H:%M:%S} rate limited; sleeping {wait + 2:.0f}s", file=sys.stderr, flush=True)
             time.sleep(wait + 2)
             continue
         if r.status_code >= 500:
             time.sleep(2 ** i)
             continue
+        if r.headers.get("x-ratelimit-resource") == "core" and int(r.headers.get("x-ratelimit-remaining", 999)) < 20:
+            wait = max(int(r.headers["x-ratelimit-reset"]) - time.time(), 0) + 5
+            print(f"  {datetime.now():%H:%M:%S} rate limit nearly used; sleeping {wait:.0f}s until reset",
+                  file=sys.stderr, flush=True)
+            time.sleep(wait)
         return r
     r.raise_for_status()
     return r
@@ -130,12 +138,14 @@ ANCHOR = re.compile(r"##\[error\]|^FAILED |\bFAILED \[|Traceback \(most recent c
 
 
 def trim_log(text: str, ctx: int = 200) -> str:
-    """Keep +-ctx lines around failure anchors (used for huge logs, e.g. pytorch)."""
+    """Keep +-ctx lines around failure anchors (used for huge logs, e.g. pytorch), plus every status line
+    (PASSED/FAILED/ERROR/RERUN) of each test that failed anywhere in the log, so in-job reruns stay visible."""
     lines = text.splitlines()
     anchors = [i for i, l in enumerate(lines) if ANCHOR.search(l.split(" ", 1)[-1])]  # skip timestamp
-    if not anchors:
+    status = {i for evs in testlog.scan(lines).values() if testlog.failed(evs) for i, _, is_status in evs if is_status}
+    if not anchors and not status:
         return "\n".join(lines[-ctx:])
-    keep = sorted({j for i in anchors for j in range(max(0, i - ctx), min(len(lines), i + ctx + 1))})
+    keep = sorted(status | {j for i in anchors for j in range(max(0, i - ctx), min(len(lines), i + ctx + 1))})
     out, prev = [], -1
     for j in keep:
         if out and j != prev + 1:
@@ -145,19 +155,31 @@ def trim_log(text: str, ctx: int = 200) -> str:
     return "\n".join(out)
 
 
-def download_log(repo: str, job_id: int, dest: Path, trim: bool) -> str:
-    if dest.exists():
-        return "ok"
+def fetch_log(repo: str, job_id: int) -> str | None:
+    """Full job log text, or None if expired / missing."""
     r = request(f"{API}/repos/{repo}/actions/jobs/{job_id}/logs")
     if r.status_code in (404, 410):
-        return "expired"
+        return None
     r.raise_for_status()
+    return r.content.decode("utf-8", errors="replace")
+
+
+def write_log(dest: Path, text: str, trim: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    text = r.content.decode("utf-8", errors="replace")
     tmp = dest.with_suffix(".tmp")
     with gzip.open(tmp, "wt") as f:
         f.write(trim_log(text) if trim else text)
     tmp.replace(dest)
+
+
+def download_log(repo: str, job_id: int, dest: Path, trim: bool, force: bool = False) -> str:
+    """force: re-download over an existing file (kept as is if the log has expired since)."""
+    if dest.exists() and not force:
+        return "ok"
+    text = fetch_log(repo, job_id)
+    if text is None:
+        return "ok" if dest.exists() else "expired"
+    write_log(dest, text, trim)
     return "ok"
 
 
@@ -200,9 +222,19 @@ def collect_run(repo: str, run: dict, done: set, out) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repos", nargs="+", default=REPOS)
-    ap.add_argument("--max-runs", type=int, help="failed runs per repo/workflow (default: 500 for pytorch, else no cap)")
+    ap.add_argument("--max-runs", type=int, help="failed runs per repo/workflow (default: 500/workflow for pytorch, else 1000)")
     ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--refetch-logs", action="store_true",
+                    help="only re-download logs of already collected jobs of --repos (e.g. after a trimming change)")
     args = ap.parse_args()
+
+    if args.refetch_logs:
+        recs = [r for r in map(json.loads, OUT.open()) if r["repo"] in args.repos and r["log_path"]]
+        for i, r in enumerate(recs, 1):
+            download_log(r["repo"], r["job_id"], ROOT / r["log_path"], r["repo"] in TRIM, force=True)
+            if i % 100 == 0 or i == len(recs):
+                print(f"{datetime.now():%H:%M:%S} refetched {i}/{len(recs)} logs", file=sys.stderr, flush=True)
+        return
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     done = set()
@@ -213,14 +245,17 @@ def main() -> None:
 
     with OUT.open("a") as out:
         for repo in args.repos:
-            cap = args.max_runs if args.max_runs is not None else DEFAULT_CAP.get(repo)
+            cap = args.max_runs if args.max_runs is not None else DEFAULT_CAP.get(repo, OTHER_CAP)
             for wf in WORKFLOWS.get(repo, [None]):
                 n_runs = n_jobs = 0
                 for run in candidate_runs(repo, wf, args.days, cap):
                     n_jobs += collect_run(repo, run, done, out)
                     n_runs += 1
-                    print(f"{repo} {wf or '*'}: {n_runs} runs, {n_jobs} new failed jobs", end="\r", file=sys.stderr)
-                print(f"{repo} {wf or '*'}: {n_runs} runs, {n_jobs} new failed jobs", file=sys.stderr)
+                    if n_runs % 25 == 0:
+                        print(f"{datetime.now():%H:%M:%S} {repo} {wf or '*'}: {n_runs} runs, {n_jobs} new failed jobs, "
+                              f"run date {run['created_at'][:10]}", file=sys.stderr, flush=True)
+                print(f"{datetime.now():%H:%M:%S} DONE {repo} {wf or '*'}: {n_runs} runs, {n_jobs} new failed jobs",
+                      file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

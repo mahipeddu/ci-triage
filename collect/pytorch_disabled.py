@@ -12,6 +12,8 @@ from pathlib import Path
 from collect.github_logs import ROOT, gh_get
 
 TITLE = re.compile(r"^DISABLED\s+(\S+)\s+\(([^)]+)\)")
+# as parsed by pytorch/test-infra torchci/lib/flakyBot/singleDisableIssue.ts parseBody (unknown values dropped)
+SUPPORTED_PLATFORMS = {"asan", "linux", "mac", "macos", "rocm", "xpu", "slow", "win", "windows", "dynamo", "inductor"}
 
 
 def search(start: date, end: date) -> list[dict]:
@@ -33,6 +35,16 @@ def search(start: date, end: date) -> list[dict]:
     return items
 
 
+def platforms(body: str) -> list[str]:
+    """Union of all 'Platforms: a, b' lines (case-insensitive), supported values only; [] = all platforms."""
+    out = set()
+    for line in body.splitlines():
+        line = line.strip().lower()
+        if line.startswith("platforms:"):
+            out |= {p.strip() for p in line[len("platforms:"):].split(",")} & SUPPORTED_PLATFORMS
+    return sorted(out)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--since", type=date.fromisoformat, default=date(2020, 1, 1))
@@ -50,7 +62,8 @@ def main() -> None:
             recs[it["number"]] = {"number": it["number"], "title": it["title"],
                                   "test_name": m.group(1), "test_class": m.group(2),
                                   "created_at": it["created_at"], "closed_at": it["closed_at"],
-                                  "state": it["state"], "author": it["user"]["login"]}
+                                  "state": it["state"], "author": it["user"]["login"],
+                                  "platforms": platforms(it.get("body") or "")}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as f:
         for r in sorted(recs.values(), key=lambda r: r["number"]):
