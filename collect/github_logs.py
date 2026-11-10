@@ -70,7 +70,7 @@ def request(url: str, params: dict | None = None) -> requests.Response:
             time.sleep(wait + 2)
             continue
         if r.status_code >= 500:
-            time.sleep(2 ** i)
+            time.sleep(min(2 ** i, 30))
             continue
         if r.headers.get("x-ratelimit-resource") == "core" and int(r.headers.get("x-ratelimit-remaining", 999)) < 20:
             wait = max(int(r.headers["x-ratelimit-reset"]) - time.time(), 0) + 5
@@ -102,15 +102,29 @@ def gh_get(path: str, params: dict | None = None, cache: bool = True):
     return data
 
 
-def gh_pages(path: str, key: str, params: dict | None = None, cache: bool = True) -> Iterator[dict]:
+def _pages(path: str, key: str, params: dict | None, cache: bool, per_page: int) -> Iterator[dict]:
     page = 1
     while True:
-        data = gh_get(path, {**(params or {}), "per_page": 100, "page": page}, cache)
+        data = gh_get(path, {**(params or {}), "per_page": per_page, "page": page}, cache)
         items = (data or {}).get(key, [])
         yield from items
-        if len(items) < 100:
+        if len(items) < per_page:
             return
         page += 1
+
+
+def gh_pages(path: str, key: str, params: dict | None = None, cache: bool = True) -> Iterator[dict]:
+    """All items of a paginated listing. Some listings 502 deterministically at per_page=100
+    (server-side timeout); those are fetched again at per_page=30."""
+    try:
+        items = list(_pages(path, key, params, cache, 100))
+    except requests.HTTPError as e:
+        if e.response is None or e.response.status_code < 500:
+            raise
+        print(f"  {datetime.now():%H:%M:%S} {e.response.status_code} at per_page=100, retrying at 30: {path}",
+              file=sys.stderr, flush=True)
+        items = list(_pages(path, key, params, cache, 30))
+    yield from items
 
 
 def candidate_runs(repo: str, workflow: str | None, days: int, cap: int | None) -> Iterator[dict]:
@@ -249,7 +263,12 @@ def main() -> None:
             for wf in WORKFLOWS.get(repo, [None]):
                 n_runs = n_jobs = 0
                 for run in candidate_runs(repo, wf, args.days, cap):
-                    n_jobs += collect_run(repo, run, done, out)
+                    try:
+                        n_jobs += collect_run(repo, run, done, out)
+                    except requests.HTTPError as e:  # persistent server error on one run: skip, retried on restart
+                        if e.response is None or e.response.status_code < 500:
+                            raise
+                        print(f"  {datetime.now():%H:%M:%S} SKIP run {run['id']}: {e}", file=sys.stderr, flush=True)
                     n_runs += 1
                     if n_runs % 25 == 0:
                         print(f"{datetime.now():%H:%M:%S} {repo} {wf or '*'}: {n_runs} runs, {n_jobs} new failed jobs, "
