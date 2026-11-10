@@ -243,17 +243,31 @@ def branch_runs(rec: dict, forward: bool) -> Iterator[dict]:
     (forward: later, oldest first; else earlier, newest first). Queried one day at a time because the list API
     returns at most 1000 runs (newest first) per query, which would drop the closest runs on busy branches."""
     t = ts(rec["run_created_at"])
+    path = f"/repos/{rec['repo']}/actions/workflows/{rec['workflow_id']}/runs"
+
+    def params(start: datetime, end: datetime) -> dict:
+        return {"branch": rec["head_branch"], "status": "completed",
+                "created": f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"}
+
+    def closed(end: datetime) -> bool:
+        return end < datetime.now(timezone.utc) - timedelta(days=1)
+
+    def ordered(runs) -> list[dict]:
+        return sorted((r for r in runs if r["head_sha"] != rec["head_sha"]
+                       and (r.get("head_repository") or {}).get("full_name") == rec["head_repo"]
+                       and (ts(r["created_at"]) > t if forward else ts(r["created_at"]) < t)),
+                      key=lambda r: r["created_at"], reverse=not forward)
+
+    # whole window in one request when it fits in one page (most branches); else day by day
+    window = (t, t + timedelta(days=FIX_WINDOW_DAYS)) if forward else (t - timedelta(days=FIX_WINDOW_DAYS), t)
+    first = gh_get(path, {**params(*window), "per_page": 100, "page": 1}, closed(window[1]))
+    if first is not None and first["total_count"] <= 100:
+        yield from ordered(first["workflow_runs"])
+        return
     for d in range(FIX_WINDOW_DAYS):
         start, end = (t + timedelta(days=d), t + timedelta(days=d + 1)) if forward else \
                      (t - timedelta(days=d + 1), t - timedelta(days=d))
-        closed = end < datetime.now(timezone.utc) - timedelta(days=1)
-        runs = gh_pages(f"/repos/{rec['repo']}/actions/workflows/{rec['workflow_id']}/runs", "workflow_runs",
-                        {"branch": rec["head_branch"], "status": "completed",
-                         "created": f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"}, cache=closed)
-        yield from sorted((r for r in runs if r["head_sha"] != rec["head_sha"]
-                           and (r.get("head_repository") or {}).get("full_name") == rec["head_repo"]
-                           and (ts(r["created_at"]) > t if forward else ts(r["created_at"]) < t)),
-                          key=lambda r: r["created_at"], reverse=not forward)
+        yield from ordered(gh_pages(path, "workflow_runs", params(start, end), cache=closed(end)))
 
 
 def first_attempt_conclusion(rec: dict, run: dict) -> str | None:
