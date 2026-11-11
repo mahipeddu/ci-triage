@@ -18,6 +18,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Iterator
 
+import requests
+
 from collect import testlog
 from collect.github_logs import FAILED, ROOT, gh_get, gh_pages, read_log
 from collect.testlog import strip
@@ -202,7 +204,10 @@ def test_failure_records(rec: dict, text: str, issues: dict) -> list[dict]:
             continue
         first_fail = next(i for i, st, _ in evs if st == "fail")
         fail_line = strip(lines[first_fail])
-        d = None if rec["label_source"] == "too_recent" else disabled_for_test(rec, test, cls, fail_line, issues)
+        try:
+            d = None if rec["label_source"] == "too_recent" else disabled_for_test(rec, test, cls, fail_line, issues)
+        except requests.RequestException:
+            d = None
         out.append({
             "repo": rec["repo"], "workflow_name": rec["workflow_name"], "run_id": rec["run_id"],
             "attempt": rec["attempt"], "job_id": rec["job_id"], "job_name": rec["job_name"],
@@ -327,6 +332,14 @@ def label(rec: dict, issues: dict, now: datetime) -> dict:
 
     if ts(rec["run_created_at"]) > now - timedelta(days=RECENT_DAYS):
         return {**rec, "label_source": "too_recent"}
+    try:
+        return label_rules(rec, text, issues, infra, lab)
+    except requests.RequestException as e:  # persistent GitHub error for this record: leave it unlabeled
+        print(f"  {datetime.now():%H:%M:%S} api_error job {rec['job_id']}: {e}", file=sys.stderr, flush=True)
+        return {**rec, "label_source": "api_error", "label_meta": {"error": str(e)[:300]}}
+
+
+def label_rules(rec: dict, text: str, issues: dict, infra, lab) -> dict:
     if rec["repo"] == "pytorch/pytorch" and (d := disabled_issue(rec, text, issues)):
         return lab("flaky", "disabled_issue", d)
     if infra:

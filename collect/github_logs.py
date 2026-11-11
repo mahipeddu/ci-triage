@@ -265,12 +265,20 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=90)
     ap.add_argument("--refetch-logs", action="store_true",
                     help="only re-download logs of already collected jobs of --repos (e.g. after a trimming change)")
+    ap.add_argument("--refetch-since", type=datetime.fromisoformat,
+                    help="with --refetch-logs: skip logs already rewritten after this local time (resume)")
     args = ap.parse_args()
 
     if args.refetch_logs:
         recs = [r for r in map(json.loads, OUT.open()) if r["repo"] in args.repos and r["log_path"]]
         for i, r in enumerate(recs, 1):
-            download_log(r["repo"], r["job_id"], ROOT / r["log_path"], r["repo"] in TRIM, force=True)
+            dest = ROOT / r["log_path"]
+            if args.refetch_since and dest.exists() and dest.stat().st_mtime > args.refetch_since.timestamp():
+                continue
+            try:
+                download_log(r["repo"], r["job_id"], dest, r["repo"] in TRIM, force=True)
+            except requests.RequestException as e:  # persistent server error: keep the old file
+                print(f"  {datetime.now():%H:%M:%S} SKIP log {r['job_id']} (kept old copy): {e}", file=sys.stderr, flush=True)
             if i % 100 == 0 or i == len(recs):
                 print(f"{datetime.now():%H:%M:%S} refetched {i}/{len(recs)} logs", file=sys.stderr, flush=True)
         return
