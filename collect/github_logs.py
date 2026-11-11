@@ -48,16 +48,21 @@ def session() -> requests.Session:
     return _session
 
 
-def request(url: str, params: dict | None = None) -> requests.Response:
-    """GET with rate-limit sleeps and retries on 5xx / network errors."""
+def request(url: str, params: dict | None = None, retry: bool = True) -> requests.Response:
+    """GET with rate-limit sleeps and retries on 5xx / network errors.
+    retry=False: return a 5xx / raise a network error at once (rate-limit sleeps still apply)."""
     if "/search/" in url:
         time.sleep(2.1)  # search API: 30 req/min
+    err: Exception | None = None
     for i in range(8):
         try:
             r = session().get(url, params=params, timeout=120)
         except requests.RequestException as e:
+            if not retry:
+                raise
             print(f"  network error {e}; retry", file=sys.stderr)
-            time.sleep(2 ** i)
+            err = e
+            time.sleep(min(2 ** i, 30))
             continue
         if r.status_code in (403, 429) and ("rate limit" in r.text.lower() or r.headers.get("x-ratelimit-remaining") == "0"):
             if r.headers.get("retry-after"):
@@ -70,6 +75,8 @@ def request(url: str, params: dict | None = None) -> requests.Response:
             time.sleep(wait + 2)
             continue
         if r.status_code >= 500:
+            if not retry:
+                return r
             time.sleep(min(2 ** i, 30))
             continue
         if r.headers.get("x-ratelimit-resource") == "core" and int(r.headers.get("x-ratelimit-remaining", 999)) < 20:
@@ -78,17 +85,24 @@ def request(url: str, params: dict | None = None) -> requests.Response:
                   file=sys.stderr, flush=True)
             time.sleep(wait)
         return r
+    if err is not None and "r" not in locals():
+        raise err
     r.raise_for_status()
     return r
 
 
-def gh_get(path: str, params: dict | None = None, cache: bool = True):
+def _cache_file(path: str, params: dict | None) -> Path:
+    url = path if path.startswith("http") else API + path
+    return CACHE / (hashlib.sha1(json.dumps([url, params], sort_keys=True).encode()).hexdigest() + ".json")
+
+
+def gh_get(path: str, params: dict | None = None, cache: bool = True, retry: bool = True):
     """Cached JSON GET. 404/410 -> None."""
     url = path if path.startswith("http") else API + path
-    f = CACHE / (hashlib.sha1(json.dumps([url, params], sort_keys=True).encode()).hexdigest() + ".json")
+    f = _cache_file(path, params)
     if cache and f.exists():
         return json.loads(f.read_text())
-    r = request(url, params)
+    r = request(url, params, retry)
     if r.status_code in (404, 410):
         data = None
     else:
@@ -102,10 +116,10 @@ def gh_get(path: str, params: dict | None = None, cache: bool = True):
     return data
 
 
-def _pages(path: str, key: str, params: dict | None, cache: bool, per_page: int) -> Iterator[dict]:
+def _pages(path: str, key: str, params: dict | None, cache: bool, per_page: int, retry: bool) -> Iterator[dict]:
     page = 1
     while True:
-        data = gh_get(path, {**(params or {}), "per_page": per_page, "page": page}, cache)
+        data = gh_get(path, {**(params or {}), "per_page": per_page, "page": page}, cache, retry)
         items = (data or {}).get(key, [])
         yield from items
         if len(items) < per_page:
@@ -113,17 +127,28 @@ def _pages(path: str, key: str, params: dict | None, cache: bool, per_page: int)
         page += 1
 
 
+NEEDS_SMALL_PAGES: set[str] = set()  # listings that failed at per_page=100 in this process
+
+
 def gh_pages(path: str, key: str, params: dict | None = None, cache: bool = True) -> Iterator[dict]:
-    """All items of a paginated listing. Some listings 502 deterministically at per_page=100
-    (server-side timeout); those are fetched again at per_page=30."""
-    try:
-        items = list(_pages(path, key, params, cache, 100))
-    except requests.HTTPError as e:
-        if e.response is None or e.response.status_code < 500:
-            raise
-        print(f"  {datetime.now():%H:%M:%S} {e.response.status_code} at per_page=100, retrying at 30: {path}",
-              file=sys.stderr, flush=True)
-        items = list(_pages(path, key, params, cache, 30))
+    """All items of a paginated listing. Some listings 5xx deterministically at per_page=100 (server-side
+    timeout): no retries at 100, go straight to per_page=30 (normal retries) and remember the listing.
+    A listing already cached at 30 but not at 100 also goes straight to 30 (memory across processes)."""
+    page1 = lambda n: _cache_file(path, {**(params or {}), "per_page": n, "page": 1})  # noqa: E731
+    small = path in NEEDS_SMALL_PAGES or (cache and page1(30).exists() and not page1(100).exists())
+    if not small:
+        try:
+            items = list(_pages(path, key, params, cache, 100, retry=False))
+        except requests.RequestException as e:  # HTTPError (5xx) or connection dropped by the server
+            status = getattr(e.response, "status_code", None)
+            if status is not None and status < 500:
+                raise
+            print(f"  {datetime.now():%H:%M:%S} {status or 'network error'} at per_page=100, using 30: {path}",
+                  file=sys.stderr, flush=True)
+            NEEDS_SMALL_PAGES.add(path)
+            small = True
+    if small:
+        items = list(_pages(path, key, params, cache, 30, retry=True))
     yield from items
 
 
