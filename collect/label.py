@@ -55,24 +55,31 @@ CONFIDENCE = {"disabled_issue": "high", "rerun": "medium", "infra": "medium",
               "regression_strong": "medium", "regression_weak": "low"}
 
 # (category, name, regex) -- matched against the failure region only, not the whole log
+# (category, name, regex) -- matched against the failure region only, not the whole log. Case-insensitive phrases
+# with word boundaries; error codes / exception class names are case-sensitive whole words ((?-i:...)), so e.g.
+# ENOTFOUND does not match inside "ModuleNotFoundError".
 INFRA = [(c, n, re.compile(p, re.I)) for c, n, p in [
-    ("timeout", "job_max_time", r"exceeded the maximum execution time"),
-    ("timeout", "operation_canceled", r"##\[error\]The operation was canceled"),
-    ("network", "dns", r"Could not resolve host|Temporary failure in name resolution|getaddrinfo|ENOTFOUND|EAI_AGAIN"),
-    ("network", "connection", r"Connection (reset by peer|refused|timed out)|ECONNRESET|ETIMEDOUT|ECONNREFUSED"
-                              r"|Network is unreachable|connection failed|read operation timed out"
-                              r"|TLS handshake timeout|RemoteDisconnected|ReadTimeoutError"),
-    ("network", "http_5xx", r"(Unexpected HTTP response|returned error|HTTP Error|status code):? *50[0234]\b"
-                            r"|\b50[234] (Bad Gateway|Service Unavailable|Gateway Time-?out)"),
-    ("runner_disk", "disk_full", r"No space left on device|ENOSPC|disk quota exceeded"),
-    ("runner_disk", "runner_lost", r"runner has received a shutdown signal|lost communication with the server"
-                                   r"|hosted runner encountered an error"),
-    ("runner_disk", "oom", r"Cannot allocate memory|Killed signal terminated program|\bout of memory\b|exit code 137"),
-    ("dependency_download", "fetch_failed", r"E: Failed to fetch|Hash Sum mismatch|Failed to download|Download failed"
-                                            r"|could not download|Unable to download"),
-    ("dependency_download", "truncated_archive", r"gzip: stdin: unexpected end of file|tar: Error is not recoverable"
-                                                 r"|Unexpected end of (archive|file)"),
-    ("dependency_download", "rate_limited", r"rate limit exceeded|toomanyrequests|429 Too Many Requests"),
+    ("timeout", "job_max_time", r"\bexceeded the maximum execution time\b"),
+    ("timeout", "operation_canceled", r"##\[error\]The operation was canceled\b"),
+    ("network", "dns", r"\bCould not resolve host\b|\bTemporary failure in name resolution\b|\bgetaddrinfo\b"
+                       r"|\b(?-i:ENOTFOUND|EAI_AGAIN)\b"),
+    ("network", "connection", r"\bConnection (reset by peer|refused|timed out)\b|\b(?-i:ECONNRESET|ETIMEDOUT|ECONNREFUSED)\b"
+                              r"|\bNetwork is unreachable\b|\bconnection failed\b|\bread operation timed out\b"
+                              r"|\bTLS handshake timeout\b|\b(?-i:RemoteDisconnected|ReadTimeoutError)\b"),
+    ("network", "ssl", r"\b(?-i:SSLError|SSLEOFError|UNEXPECTED_EOF_WHILE_READING|CERTIFICATE_VERIFY_FAILED)\b"
+                       r"|\bMax retries exceeded with url\b"),
+    ("network", "http_5xx", r"\b(Unexpected HTTP response|returned error|HTTP Error|status code):? *50[0234]\b"
+                            r"|\b50[234] (Bad Gateway|Service Unavailable|Gateway Time-?out)\b"),
+    ("runner_disk", "disk_full", r"\bNo space left on device\b|\b(?-i:ENOSPC)\b|\bdisk quota exceeded\b"),
+    ("runner_disk", "runner_lost", r"\brunner has received a shutdown signal\b|\blost communication with the server\b"
+                                   r"|\bhosted runner encountered an error\b"),
+    ("runner_disk", "oom", r"\bCannot allocate memory\b|\bKilled signal terminated program\b|\bout of memory\b"
+                           r"|\bexit code 137\b"),
+    ("dependency_download", "fetch_failed", r"\bFailed to fetch\b|\bHash Sum mismatch\b|\bFailed to download\b"
+                                            r"|\bDownload failed\b|\bcould not download\b|\bUnable to download\b"),
+    ("dependency_download", "truncated_archive", r"\bgzip: stdin: unexpected end of file\b"
+                                                 r"|\btar: Error is not recoverable\b|\bUnexpected end of (archive|file)\b"),
+    ("dependency_download", "rate_limited", r"\brate limit exceeded\b|\b(?-i:toomanyrequests)\b|\b429 Too Many Requests\b"),
 ]]
 
 DISABLED_BOT = "pytorch-bot[bot]"
@@ -383,6 +390,45 @@ def refresh_derived(rec: dict) -> dict:
     return rec
 
 
+def relabel_infra_changed(recs: list[dict], issues: dict, now: datetime) -> list[dict]:
+    """After an INFRA pattern change: recompute infra_match (API-free); jobs whose infra status flips are fully
+    re-labeled with label() (cached API work), others only get the new infra_match. Prints a before/after audit."""
+    before, after = Counter(), Counter()
+    moved: dict[tuple[str, str], list[str]] = defaultdict(list)
+    out, n_relabel = [], 0
+    for i, r in enumerate(recs, 1):
+        old = r["infra_match"]
+        new = None
+        if r["log_path"]:
+            m = infra_match(r, failure_region(read_log(r["log_path"]).splitlines()))
+            new = m and {"category": m[0], "pattern": m[1], "line": m[2][:300]}
+        po, pn = old and old["pattern"], new and new["pattern"]
+        before[po] += 1
+        after[pn] += 1
+        if po != pn:
+            moved[(str(po), str(pn))].append(f"{r['repo']} | {r['job_name'][:40]} | {((new or old)['line'])[:110]}")
+        if (old is None) != (new is None) and r["label_source"] != "aggregator":
+            r = refresh_derived(label(r, issues, now))
+            n_relabel += 1
+        else:
+            r = {**r, "infra_match": new}
+            if r["label_source"] == "infra" and new:
+                r["label_meta"] = {"category": new["category"], "pattern": new["pattern"]}
+        out.append(r)
+        if i % 1000 == 0:
+            print(f"{datetime.now():%H:%M:%S} audited {i}/{len(recs)}, re-labeled {n_relabel}", file=sys.stderr, flush=True)
+    print("== infra pattern audit: jobs per first-matching pattern ==")
+    print(f"  {'pattern':20} {'before':>7} {'after':>7}")
+    for pat in sorted(set(before) | set(after), key=str):
+        print(f"  {str(pat):20} {before[pat]:7} {after[pat]:7}")
+    print(f"\n== changed matches (before -> after), 3 examples each; {n_relabel} jobs fully re-labeled ==")
+    for (po, pn), ex in sorted(moved.items()):
+        print(f"-- {po} -> {pn}: {len(ex)} jobs")
+        for e in ex[:3]:
+            print(f"     {e}")
+    return out
+
+
 def label(rec: dict, issues: dict, now: datetime) -> dict:
     text = read_log(rec["log_path"]) if rec["log_path"] else ""
     region = failure_region(text.splitlines())
@@ -432,6 +478,11 @@ def main() -> None:
     ap.add_argument("--tests-out", type=Path, default=ROOT / "data/processed/pytorch_test_failures.jsonl",
                     help="per-test traceback records for failed pytorch jobs")
     ap.add_argument("--repos", nargs="*", help="only label these repos")
+    ap.add_argument("--relabel-infra-changed", action="store_true",
+                    help="recompute infra_match on the existing --out file; fully re-label only jobs whose infra "
+                         "status changed (cached API work), then refresh-derived; prints a before/after audit")
+    ap.add_argument("--now", type=lambda v: datetime.fromisoformat(v).astimezone(timezone.utc),
+                    help="labeling time for the recency rule (default: now)")
     ap.add_argument("--refresh-derived", action="store_true",
                     help="no API calls: re-apply aggregator exclusion + fix_relevant to the existing --out file")
     ap.add_argument("--examples", type=int, default=5, help="infra example matches to print per pattern")
@@ -446,10 +497,17 @@ def main() -> None:
     recs = [json.loads(l) for l in args.inp.open()]
     if args.repos:
         recs = [r for r in recs if r["repo"] in args.repos]
-    now = datetime.now(timezone.utc)
+    now = args.now or datetime.now(timezone.utc)
     out = []
     n_tests = 0
-    if args.refresh_derived:
+    if args.relabel_infra_changed:
+        out = relabel_infra_changed([json.loads(l) for l in args.out.open()], issues, now)
+        tmp = args.out.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in out))
+        tmp.replace(args.out)
+        recs = []
+        args.refresh_derived = True  # skip the normal write path below
+    elif args.refresh_derived:
         out = [refresh_derived(json.loads(l)) for l in args.out.open()]
         if args.repos:
             out = [r for r in out if r["repo"] in args.repos]

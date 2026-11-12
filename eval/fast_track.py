@@ -21,7 +21,7 @@ from pathlib import Path
 import requests
 
 from collect.github_logs import ROOT, read_log
-from collect.label import FIX_WINDOW_DAYS, INFRA, failure_region, normalize, ts
+from collect.label import FIX_WINDOW_DAYS, INFRA, failure_region, module_tokens, normalize, ts
 
 CLASSES = ["flaky", "infra", "regression"]
 LABEL_TO_CLASS = {"flaky": "flaky", "infra": "infra", "regression_strong": "regression", "regression_weak": "regression"}
@@ -52,6 +52,7 @@ def incidents(path: Path, max_lines: int, exclude: set[str] = frozenset()) -> li
         fix_runs = {j["label_meta"]["fix_sha"]: j["label_meta"]["fix_run_id"] for j in jobs
                     if j["label"].startswith("regression")}
         rel = [j["label_meta"].get("fix_relevant") for j in jobs if j["label"].startswith("regression")]
+        all_files = {f for j in jobs if j["label"].startswith("regression") for f in j["label_meta"]["touched_files"]}
         fix_rel = True if True in rel else False if False in rel else None
         out.append({"id": inc, "repo": repo, "t": ts(rep["job_started_at"]), "y": next(iter(classes)),
                     "source": rep["label_source"], "job": rep["job_name"], "steps": rep["failed_steps"],
@@ -60,7 +61,9 @@ def incidents(path: Path, max_lines: int, exclude: set[str] = frozenset()) -> li
                                      for f in j["label_meta"]["touched_files"]})[:10],
                     "text": f"job: {rep['job_name']}\nfailed steps: {', '.join(rep['failed_steps'])}\n" + "\n".join(region),
                     "n_jobs": len(jobs), "region": region, "url": rep["html_url"], "fix_runs": fix_runs,
-                    "fix_relevant": fix_rel})
+                    "fix_relevant": fix_rel, "non_ci_fix": any(not CI_FILE.search(f) for f in all_files),
+                    "n_fix_files": len(all_files),
+                    "infra_pattern": (rep.get("infra_match") or {}).get("pattern")})
     return sorted(out, key=lambda i: i["t"])
 
 
@@ -137,6 +140,80 @@ SIMILAR PAST INCIDENTS:
 {context}
 
 Answer with JSON only: {{"category": "flaky|infra|regression|test_bug", "likely_cause": "<one sentence>", "similar_incidents": ["<ids of the relevant past incidents>"]}}"""
+
+
+# v2: definitions phrased the way the auto-labels are produced, plus fixed worked examples from train
+PROMPT_V2 = """You triage failed CI jobs. Classify the NEW failure into exactly one category. The categories are
+defined by what happened after the failure:
+- regression: the failure comes from the code under test. It keeps failing on that commit and passes only after a
+  later code change (compile/lint/type errors, reproducible assertion or test failures).
+- flaky: the same commit passes when the job is simply re-run (nondeterministic: timing, ordering, races,
+  intermittent test failures).
+- infra: the CI environment failed, not the code: network errors, HTTP 5xx, DNS, package/dependency/artifact
+  download failures, runner lost, out of disk or memory, job-level timeouts. Use infra for these even if a later
+  commit happened to pass.
+Use the similar past incidents (with their known categories and fixes) as evidence, but judge the new log itself.
+
+WORKED EXAMPLES:
+{examples}
+
+NEW FAILURE (repo {repo}):
+{text}
+
+SIMILAR PAST INCIDENTS:
+{context}
+
+Answer with JSON only: {{"category": "flaky|infra|regression", "likely_cause": "<one sentence>", "similar_incidents": ["<ids of the relevant past incidents>"]}}"""
+
+
+CI_FILE = re.compile(r"^(\.github/|ci/|\.ci/)|\.(yml|yaml|ps1|sh)$")
+EXAMPLE_INFRA_PATTERNS = {"fetch_failed", "http_5xx", "connection", "dns", "truncated_archive"}
+FLAKY_EXAMPLE_ID = "25e91f10ff47"  # libavif Windows file lock during link, passed on rerun (reviewed, kept fixed)
+NOISE = re.compile(r"process completed with exit code|^\[command\]|git config|post job|cleaning up|^##\[(end)?group\]")
+TEST_FAIL = re.compile(r"\bfailed\b|assert|error:", re.I)
+
+
+def excerpt(region: list[str], anchor: re.Pattern, n: int = 10) -> list[str] | None:
+    lines = [l for l in region if not NOISE.search(l)]
+    hits = [k for k, l in enumerate(lines) if anchor.search(l)]
+    return lines[max(0, hits[-1] - n + 1):hits[-1] + 1] if hits else None
+
+
+def worked_examples(train: list[dict], seed: int = 0) -> str:
+    """One train incident per class, consistent with the v2 definitions; same examples for every query.
+    regression: strong label, relevant fix touching at least one non-CI file and at most 10 files (no large
+    syncs), error line, no flaky/infra hints;
+    flaky: fixed reviewed incident (FLAKY_EXAMPLE_ID), else a rerun-passed failure without network wording;
+    infra: download/network/http_5xx pattern match (excerpt ends on it), not a doc/link-check job."""
+    infra_rx = re.compile("|".join(f"(?:{rx.pattern})" for _, _, rx in INFRA), re.I)
+    net = re.compile(r"ssl|connection|max retries|https?://|timed? ?out|resolve|download|network|socket", re.I)
+    joined = lambda i: "\n".join(i["region"])  # noqa: E731
+    spec = {
+        "regression": (lambda i: i["source"] == "regression_strong" and i["fix_relevant"] is True and i["non_ci_fix"]
+                       and i["n_fix_files"] <= 10 and not infra_rx.search(joined(i))
+                       and not FLAKY_HINT.search(joined(i)), TEST_FAIL),
+        "flaky": (lambda i: i["id"] == FLAKY_EXAMPLE_ID, TEST_FAIL),
+        "infra": (lambda i: i["source"] == "infra" and i["infra_pattern"] in EXAMPLE_INFRA_PATTERNS
+                  and not re.search(r"doc|link", i["job"], re.I), infra_rx),
+    }
+    flaky_fallback = lambda i: i["source"] == "rerun" and not infra_rx.search(joined(i)) and not net.search(joined(i))  # noqa: E731
+    def fix_files(ex: dict) -> str:  # files sharing a module token with the failure first, non-CI before CI
+        toks = set().union(*(module_tokens(l) for l in ex["region"]))
+        return ", ".join(sorted(ex["files"], key=lambda f: (not (module_tokens(f) & toks), bool(CI_FILE.search(f))))[:2])
+
+    why = {"regression": lambda ex: f"fixed by a later commit touching {fix_files(ex)}",
+           "flaky": lambda ex: "the same commit passed when the job was re-run",
+           "infra": lambda ex: "the CI environment failed (network / runner / download / timeout), not the code"}
+    out = []
+    for c in ("regression", "flaky", "infra"):
+        ok, anchor = spec[c]
+        pool = [(i, e) for i in train if i["y"] == c and ok(i) and (e := excerpt(i["region"], anchor))]
+        if not pool and c == "flaky":
+            pool = [(i, e) for i in train if i["y"] == c and flaky_fallback(i) and (e := excerpt(i["region"], anchor))]
+        ex, lines = random.Random(f"{seed}:{c}").choice(pool)
+        out.append(f"Log ({ex['repo']}, job {ex['job']}):\n" + "\n".join(l[:200] for l in lines)
+                   + f"\nAnswer: {{\"category\": \"{c}\", \"likely_cause\": \"{why[c](ex)}\"}}")
+    return "\n\n".join(out)
 
 
 def cache_path(prompt: str, model: str) -> Path:
@@ -265,6 +342,9 @@ def main() -> None:
     ap.add_argument("--low-n", type=int, default=15, help="mark classes with fewer test incidents as low n")
     ap.add_argument("--disagreements", type=Path, help="write Gemini=infra vs label=regression cases here")
     ap.add_argument("--note", default="", help="extra scope note for the results file")
+    ap.add_argument("--prompt", choices=["v1", "v2"], default="v1",
+                    help="v1: original; v2: label-procedure definitions + 3 worked examples from train")
+    ap.add_argument("--summary-json", type=Path, help="write headline numbers (for teacher comparison tables)")
     args = ap.parse_args()
     exclude = set(args.exclude_repos)
 
@@ -307,6 +387,7 @@ def main() -> None:
                else sorted(random.Random(0).sample(range(len(test)), min(args.llm_n, len(test)))))
         state: dict = {}
         failed = missing = 0
+        examples = worked_examples(train) if args.prompt == "v2" else ""
         print(f"{time.strftime('%H:%M:%S')} gemini 0/{len(idx)}", file=sys.stderr, flush=True)
         for n, j in enumerate(idx, 1):
             q = test[j]
@@ -314,7 +395,8 @@ def main() -> None:
                 f"[{train[i]['id']}] category={train[i]['y']} (label source: {train[i]['source']})"
                 f"{' fix touched: ' + ', '.join(train[i]['files']) if train[i]['files'] else ''}\n{train[i]['text'][:1500]}"
                 for i, _ in hits[j])
-            prompt = PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx)
+            prompt = (PROMPT_V2.format(repo=q["repo"], text=q["text"][:6000], context=ctx, examples=examples)
+                      if args.prompt == "v2" else PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx))
             if args.cache_only and not cache_path(prompt, args.model).exists():
                 missing += 1
                 continue
@@ -329,7 +411,7 @@ def main() -> None:
             if n % 5 == 0 or n == len(idx):
                 print(f"{time.strftime('%H:%M:%S')} gemini {n}/{len(idx)}", file=sys.stderr, flush=True)
         preds["llm"] = {j: SCORE_MAP.get(c, c) for j, (c, _) in answers.items()}
-        names["llm"] = f"{args.model} + RAG (BM25 top-{args.k}), {args.llm_sample} sample"
+        names["llm"] = f"{args.model} + RAG (BM25 top-{args.k}), prompt {args.prompt}, {args.llm_sample} sample"
         raw = Counter(c for c, _ in answers.values())
         llm_note = (f"Gemini: {len(answers)} of {len(idx)} sampled test incidents scored ({args.llm_sample} sample"
                     + (f"; {failed} unparseable" if failed else "") + (f"; {missing} not in cache" if missing else "")
@@ -359,9 +441,8 @@ def main() -> None:
             return v + (f" (low n={counts[k]})" if k in CLASSES and 0 < counts[k] < args.low_n else "")
         return f"| {label} | {cell('macro')} | {cell('flaky')} | {cell('infra')} | {cell('regression')} | {h} | {len(g)} |"
 
-    paired_lines = []
-    if sample and args.bootstrap:
-        js = sorted(sample)
+    def paired(js: list[int]) -> dict[str, tuple[float, float, float, float]]:
+        """Gemini − kNN F1 on the same incidents: (point, CI low, CI high, share of resamples ≤ 0)."""
         g = [test[j]["y"] for j in js]
         gp, kp = [preds["llm"][j] for j in js], [preds["knn"][j] for j in js]
         rng = random.Random(1)
@@ -374,14 +455,26 @@ def main() -> None:
                 if a[k] == a[k] and b[k] == b[k]:
                     diffs[k].append(a[k] - b[k])
         full_a, full_b = f1s(g, gp), f1s(g, kp)
-        paired_lines = ["Paired bootstrap, Gemini − BM25 kNN on the same incidents "
-                        f"(n={len(js)}, {args.bootstrap} resamples):", ""]
+        out = {}
         for k in ("macro", "flaky"):
             d = sorted(diffs[k])
-            paired_lines.append(
-                f"- {k}-F1 difference: {full_a[k] - full_b[k]:+.3f} "
-                f"[{d[int(0.025 * len(d))]:+.3f} – {d[min(len(d) - 1, int(0.975 * len(d)))]:+.3f}], "
-                f"share of resamples with difference ≤ 0: {sum(x <= 0 for x in d) / len(d):.2f}")
+            if not d:  # class absent from every resample (tiny sample)
+                out[k] = (full_a[k] - full_b[k], float("nan"), float("nan"), float("nan"))
+                continue
+            out[k] = (full_a[k] - full_b[k], d[int(0.025 * len(d))], d[min(len(d) - 1, int(0.975 * len(d)))],
+                      sum(x <= 0 for x in d) / len(d))
+        return out
+
+    paired_lines, paired_res = [], {}
+    if sample and args.bootstrap:
+        fix_rel_js = sorted(j for j in sample if test[j]["y"] != "regression" or test[j]["fix_relevant"] is True)
+        for name, js in [("all", sorted(sample)), ("fix_relevant=true only", fix_rel_js)]:
+            paired_res[name] = r = paired(js)
+            paired_lines += [f"Paired bootstrap, Gemini − BM25 kNN on the same incidents, {name} "
+                             f"(n={len(js)}, {args.bootstrap} resamples):", ""]
+            paired_lines += [f"- {k}-F1 difference: {d:+.3f} [{lo:+.3f} – {hi:+.3f}], "
+                             f"share of resamples with difference ≤ 0: {sh:.2f}" for k, (d, lo, hi, sh) in r.items()]
+            paired_lines.append("")
     header = ["| method | macro-F1 | F1 flaky | F1 infra | F1 regression | hit@5 | n |", "|---|---|---|---|---|---|---|"]
     strong_only = lambda q: q["source"] != "regression_weak"  # noqa: E731
     fix_rel_only = lambda q: q["y"] != "regression" or q["fix_relevant"] is True  # noqa: E731
@@ -441,6 +534,14 @@ def main() -> None:
     ]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n")
+    if args.summary_json and sample:
+        js = sorted(sample)
+        g = [test[j]["y"] for j in js]
+        args.summary_json.write_text(json.dumps({
+            "model": args.model, "prompt": args.prompt, "n": len(js),
+            "llm": f1s(g, [preds["llm"][j] for j in js]), "knn_same": f1s(g, [preds["knn"][j] for j in js]),
+            "llm_ci": bootstrap_ci(g, [preds["llm"][j] for j in js], args.bootstrap) if args.bootstrap else {},
+            "paired": paired_res, "raw": dict(Counter(c for c, _ in answers.values()))}, indent=1))
     print("\n".join(lines))
 
     if args.disagreements:

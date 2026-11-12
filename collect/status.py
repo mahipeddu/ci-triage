@@ -73,7 +73,10 @@ def main() -> None:
               else [], labeling or ("" if "refetch done" in tail else "after re-download")))
     print(bar("small: labeling mpv/libavif/arrow", progress(data / "label_small.log"),
               "done" if "SMALL DONE" in small else "FAILED (see data/label_small.log)" if "SMALL FAILED" in small else ""))
-    print(bar("fast-track eval: Gemini", progress(data / "eval_small.log"),
+    runs = [m[1] for l in ev.splitlines() if (m := re.match(r"== (\S+ \S+ n=\d+)", l))]
+    if runs:
+        print(f"{'teacher runs':34} run {len(runs)}/6: {runs[-1]}" + ("  (all done)" if "EVAL DONE" in ev else ""))
+    print(bar("fast-track eval: Gemini", progress(data / "eval_small.log", "gemini 0/"),
               "done" if "EVAL DONE" in ev else "FAILED (see data/eval_small.log)" if "EVAL FAILED" in ev
               else "" if ev else "after small labeling"))
 
