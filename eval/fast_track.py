@@ -34,11 +34,11 @@ TOKEN = re.compile(r"[a-z_][a-z0-9_]+")
 
 # ---------- data ----------
 
-def incidents(path: Path, max_lines: int) -> list[dict]:
+def incidents(path: Path, max_lines: int, exclude: set[str] = frozenset()) -> list[dict]:
     by_inc: dict[str, list[dict]] = defaultdict(list)
     for line in path.open():
         r = json.loads(line)
-        if r["label"] in LABEL_TO_CLASS and r["log_path"]:
+        if r["label"] in LABEL_TO_CLASS and r["log_path"] and r["repo"] not in exclude:
             by_inc[(r["repo"], r["incident_id"])].append(r)
     out = []
     for (repo, inc), jobs in by_inc.items():
@@ -49,13 +49,15 @@ def incidents(path: Path, max_lines: int) -> list[dict]:
         region = [normalize(l) for l in failure_region(read_log(rep["log_path"]).splitlines())]
         region = [l for l in region if l][-max_lines:]
         fixes = {j["label_meta"]["fix_sha"] for j in jobs if j["label"].startswith("regression")}
+        fix_runs = {j["label_meta"]["fix_sha"]: j["label_meta"]["fix_run_id"] for j in jobs
+                    if j["label"].startswith("regression")}
         out.append({"id": inc, "repo": repo, "t": ts(rep["job_started_at"]), "y": next(iter(classes)),
                     "source": rep["label_source"], "job": rep["job_name"], "steps": rep["failed_steps"],
                     "sig": (rep["job_name"], region[0] if region else ""), "fixes": fixes,
                     "files": sorted({f for j in jobs if j["label"].startswith("regression")
                                      for f in j["label_meta"]["touched_files"]})[:10],
                     "text": f"job: {rep['job_name']}\nfailed steps: {', '.join(rep['failed_steps'])}\n" + "\n".join(region),
-                    "n_jobs": len(jobs)})
+                    "n_jobs": len(jobs), "region": region, "url": rep["html_url"], "fix_runs": fix_runs})
     return sorted(out, key=lambda i: i["t"])
 
 
@@ -63,6 +65,17 @@ def time_split(incs: list[dict], test_frac: float, gap_days: int) -> tuple[list[
     test = incs[int(len(incs) * (1 - test_frac)):]
     cutoff = test[0]["t"] - timedelta(days=gap_days)
     return [i for i in incs if i["t"] < cutoff], test
+
+
+def per_repo_split(incs: list[dict], test_frac: float, gap_days: int) -> tuple[list[dict], list[dict], dict]:
+    """time_split within each repo, then pool. Returns pooled train, test (time-sorted) and per-repo test starts."""
+    train, test, starts = [], [], {}
+    for repo in sorted({i["repo"] for i in incs}):
+        tr, te = time_split([i for i in incs if i["repo"] == repo], test_frac, gap_days)
+        train += tr
+        test += te
+        starts[repo] = te[0]["t"]
+    return sorted(train, key=lambda i: i["t"]), sorted(test, key=lambda i: i["t"]), starts
 
 
 # ---------- retrieval ----------
@@ -121,9 +134,12 @@ SIMILAR PAST INCIDENTS:
 Answer with JSON only: {{"category": "flaky|infra|regression|test_bug", "likely_cause": "<one sentence>", "similar_incidents": ["<ids of the relevant past incidents>"]}}"""
 
 
+def cache_path(prompt: str, model: str) -> Path:
+    return LLM_CACHE / (hashlib.sha1(f"{model}\n{prompt}".encode()).hexdigest() + ".json")
+
+
 def gemini(prompt: str, model: str, min_interval: float, state: dict) -> dict | None:
-    key = hashlib.sha1(f"{model}\n{prompt}".encode()).hexdigest()
-    f = LLM_CACHE / f"{key}.json"
+    f = cache_path(prompt, model)
     if f.exists():
         return json.loads(f.read_text())
     body = {"contents": [{"parts": [{"text": prompt}]}],
@@ -157,13 +173,38 @@ def gemini(prompt: str, model: str, min_interval: float, state: dict) -> dict | 
     return None
 
 
-def parse_category(resp: dict | None) -> str | None:
+def parse_answer(resp: dict | None) -> tuple[str, str] | None:
+    """(raw category, likely_cause) or None if unparseable."""
     try:
-        text = resp["candidates"][0]["content"]["parts"][0]["text"]
-        cat = json.loads(text)["category"].strip().lower()
-        return cat if cat in CLASSES + ["test_bug"] else None
+        ans = json.loads(resp["candidates"][0]["content"]["parts"][0]["text"])
+        cat = ans["category"].strip().lower()
+        return (cat, str(ans.get("likely_cause", ""))) if cat in CLASSES + ["test_bug"] else None
     except (KeyError, IndexError, TypeError, ValueError, AttributeError):
         return None
+
+
+def parse_category(resp: dict | None) -> str | None:
+    a = parse_answer(resp)
+    return a and a[0]
+
+
+SCORE_MAP = {"test_bug": "regression"}  # a test bug is fixed by a code change; gold has no test_bug class
+
+
+def stratified(test: list[dict], n: int, seed: int = 0) -> list[int]:
+    """Round-robin over repos (shuffled within each repo) so one repo cannot dominate the LLM sample."""
+    by_repo: dict[str, list[int]] = defaultdict(list)
+    for j, q in enumerate(test):
+        by_repo[q["repo"]].append(j)
+    rng = random.Random(seed)
+    for v in by_repo.values():
+        rng.shuffle(v)
+    picked: list[int] = []
+    while len(picked) < n and any(by_repo.values()):
+        for r in sorted(by_repo):
+            if by_repo[r] and len(picked) < n:
+                picked.append(by_repo[r].pop())
+    return sorted(picked)
 
 
 # ---------- metrics ----------
@@ -201,29 +242,43 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inp", type=Path, default=ROOT / "data/processed/failures_labeled_small.jsonl")
     ap.add_argument("--out", type=Path, default=ROOT / "eval/results_small.md")
+    ap.add_argument("--exclude-repos", nargs="*", default=[], help="repos left out of the eval")
     ap.add_argument("--test-frac", type=float, default=0.2)
+    ap.add_argument("--split", choices=["global", "per-repo"], default="global",
+                    help="global: one time cut over all incidents; per-repo: cut each repo on its own timeline, pool")
     ap.add_argument("--gap-days", type=int, default=3)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--max-lines", type=int, default=80, help="failure-region lines kept per incident")
     ap.add_argument("--llm-n", type=int, default=150, help="max test incidents sent to Gemini")
+    ap.add_argument("--llm-sample", choices=["random", "stratified"], default="random",
+                    help="random: uniform over test incidents; stratified: round-robin over repos")
+    ap.add_argument("--cache-only", action="store_true", help="score cached Gemini answers only, no new requests")
     ap.add_argument("--model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"))
     ap.add_argument("--min-interval", type=float, default=7.0, help="seconds between Gemini requests (free tier)")
     ap.add_argument("--counts-only", action="store_true", help="print split class counts and exit")
     ap.add_argument("--bootstrap", type=int, default=0, help="resamples for 95%% CIs (0 = no CIs)")
     ap.add_argument("--low-n", type=int, default=15, help="mark classes with fewer test incidents as low n")
+    ap.add_argument("--disagreements", type=Path, help="write Gemini=infra vs label=regression cases here")
+    ap.add_argument("--note", default="", help="extra scope note for the results file")
     args = ap.parse_args()
+    exclude = set(args.exclude_repos)
 
     # label censoring: regression labels need up to FIX_WINDOW_DAYS to appear, so newer incidents are biased
-    # toward infra/flaky. max_t = latest job start in the input (all records, labeled or not) ~ collection date.
-    max_t = max(ts(json.loads(l)["job_started_at"]) for l in args.inp.open())
+    # toward infra/flaky. max_t = latest job start in the input (all records of included repos) ~ collection date.
+    max_t = max(ts(r["job_started_at"]) for r in map(json.loads, args.inp.open()) if r["repo"] not in exclude)
     censor = max_t - timedelta(days=FIX_WINDOW_DAYS)
-    all_incs = incidents(args.inp, args.max_lines)
+    all_incs = incidents(args.inp, args.max_lines, exclude)
     incs = [i for i in all_incs if i["t"] <= censor]
-    train, test = time_split(incs, args.test_frac, args.gap_days)
+    if args.split == "per-repo":
+        train, test, starts = per_repo_split(incs, args.test_frac, args.gap_days)
+    else:
+        train, test = time_split(incs, args.test_frac, args.gap_days)
+        starts = {}
     for name, part in [("train", train), ("test", test)]:
         c = Counter(i["y"] for i in part)
         print(f"{name}: n={len(part)} " + " ".join(f"{k}={c[k]}" for k in CLASSES)
-              + f" ({part[0]['t']:%Y-%m-%d} .. {part[-1]['t']:%Y-%m-%d})", file=sys.stderr)
+              + f" ({part[0]['t']:%Y-%m-%d} .. {part[-1]['t']:%Y-%m-%d}) by repo {dict(Counter(i['repo'] for i in part))}",
+              file=sys.stderr)
     print(f"censoring cutoff {censor:%Y-%m-%d %H:%M} UTC (max_t {max_t:%Y-%m-%d} - {FIX_WINDOW_DAYS} d): "
           f"dropped {len(all_incs) - len(incs)} of {len(all_incs)} labeled incidents", file=sys.stderr)
     if args.counts_only:
@@ -231,20 +286,22 @@ def main() -> None:
     majority = Counter(i["y"] for i in train).most_common(1)[0][0]
     search = bm25_index([i["text"] for i in train])
     hits = [search(q["text"], args.k) for q in test]
-    gold = [q["y"] for q in test]
-
     has_rel = [any(relevant(q, d) for d in train) for q in test]
-    hit = [any(relevant(q, train[i]) for i, _ in h) for q, h, r in zip(test, hits, has_rel) if r]
-    hit_at_k = sum(hit) / len(hit) if hit else float("nan")
+    hit_ok = [any(relevant(q, train[i]) for i, _ in h) for q, h in zip(test, hits)]
 
-    rows = [("rules (infra patterns, flaky keywords, else train majority)", gold,
-             [rules_predict(q, majority) for q in test], None),
-            (f"BM25 kNN (k={args.k}, majority vote)", gold, [knn_predict(h, train, majority) for h in hits], hit_at_k)]
-
-    if os.environ.get("GEMINI_API_KEY"):
-        idx = sorted(random.Random(0).sample(range(len(test)), min(args.llm_n, len(test))))
+    preds: dict[str, dict[int, str]] = {
+        "rules": {j: rules_predict(q, majority) for j, q in enumerate(test)},
+        "knn": {j: knn_predict(h, train, majority) for j, h in enumerate(hits)},
+    }
+    names = {"rules": "rules (infra patterns, flaky keywords, else train majority)",
+             "knn": f"BM25 kNN (k={args.k}, majority vote)"}
+    answers: dict[int, tuple[str, str]] = {}  # test index -> (raw Gemini category, likely_cause)
+    llm_note = ""
+    if os.environ.get("GEMINI_API_KEY") or args.cache_only:
+        idx = (stratified(test, args.llm_n) if args.llm_sample == "stratified"
+               else sorted(random.Random(0).sample(range(len(test)), min(args.llm_n, len(test)))))
         state: dict = {}
-        g_gold, g_pred, g_hit, failed = [], [], [], 0
+        failed = missing = 0
         print(f"{time.strftime('%H:%M:%S')} gemini 0/{len(idx)}", file=sys.stderr, flush=True)
         for n, j in enumerate(idx, 1):
             q = test[j]
@@ -252,64 +309,90 @@ def main() -> None:
                 f"[{train[i]['id']}] category={train[i]['y']} (label source: {train[i]['source']})"
                 f"{' fix touched: ' + ', '.join(train[i]['files']) if train[i]['files'] else ''}\n{train[i]['text'][:1500]}"
                 for i, _ in hits[j])
-            resp = gemini(PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx), args.model,
-                          args.min_interval, state)
+            prompt = PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx)
+            if args.cache_only and not cache_path(prompt, args.model).exists():
+                missing += 1
+                continue
+            resp = gemini(prompt, args.model, args.min_interval, state)
             if resp is None:  # daily quota or persistent errors: stop, report what we have (rerun resumes)
                 break
-            cat = parse_category(resp)
-            if cat is None:
+            a = parse_answer(resp)
+            if a is None:
                 failed += 1
-                continue
-            g_gold.append(q["y"])
-            g_pred.append(cat)
-            if has_rel[j]:
-                g_hit.append(any(relevant(q, train[i]) for i, _ in hits[j]))
+            else:
+                answers[j] = a
             if n % 5 == 0 or n == len(idx):
                 print(f"{time.strftime('%H:%M:%S')} gemini {n}/{len(idx)}", file=sys.stderr, flush=True)
-        rows.append((f"{args.model} + RAG (BM25 top-{args.k}), {len(g_gold)} of {len(test)} test incidents"
-                     + (f", {failed} unparsed/failed" if failed else ""), g_gold, g_pred,
-                     sum(g_hit) / len(g_hit) if g_hit else float("nan")))
+        preds["llm"] = {j: SCORE_MAP.get(c, c) for j, (c, _) in answers.items()}
+        names["llm"] = f"{args.model} + RAG (BM25 top-{args.k}), {args.llm_sample} sample"
+        raw = Counter(c for c, _ in answers.values())
+        llm_note = (f"Gemini: {len(answers)} of {len(idx)} sampled test incidents scored ({args.llm_sample} sample"
+                    + (f"; {failed} unparseable" if failed else "") + (f"; {missing} not in cache" if missing else "")
+                    + f"). Raw answers: {', '.join(f'{c} {raw[c]}' for c in CLASSES + ['test_bug'])}; "
+                    f"test_bug is scored as regression (a test bug is fixed by a code change).")
     else:
         print("GEMINI_API_KEY not set: skipping Gemini + RAG", file=sys.stderr)
 
     def fmt(x: float) -> str:
         return "–" if x != x else f"{x:.3f}"
 
-    dist = lambda xs: ", ".join(f"{c} {Counter(xs)[c]}" for c in CLASSES)  # noqa: E731
-    lines = [
-        "# Fast-track results (mpv, libavif, arrow)",
-        "",
-        f"Input: `{args.inp.name}`. Unit: incident (matrix duplicates grouped), labeled incidents only "
-        f"(regression_strong + regression_weak = regression; no test_bug labels exist).",
-        f"Label censoring: incidents after {censor:%Y-%m-%d %H:%M} UTC (latest job start {max_t:%Y-%m-%d} − "
-        f"{FIX_WINDOW_DAYS} days fix window) dropped ({len(all_incs) - len(incs)} of {len(all_incs)}), since their "
-        f"regression labels may not have appeared yet.",
-        f"Time-based split: last {args.test_frac:.0%} of incidents = test "
-        f"({test[0]['t']:%Y-%m-%d} – {test[-1]['t']:%Y-%m-%d}), train = incidents before test start − {args.gap_days} days.",
-        f"Train n={len(train)} ({dist([i['y'] for i in train])}); test n={len(test)} ({dist(gold)}).",
-        f"LLM: `{args.model}` (Gemini API free tier, temperature 0, default thinking: thinkingConfig is rejected by this model), BM25 top-{args.k} as context.",
-        "",
-        "| method | macro-F1 | F1 flaky | F1 infra | F1 regression | hit@5 | n |",
-        "|---|---|---|---|---|---|---|",
-    ]
-    for name, g, p, h in rows:
+    def row(label: str, m: str, keep) -> str:
+        js = [j for j in preds[m] if keep(test[j])]
+        g, p = [test[j]["y"] for j in js], [preds[m][j] for j in js]
+        if not g:
+            return f"| {label} | – | – | – | – | – | 0 |"
         s = f1s(g, p)
-        ci = bootstrap_ci(g, p, args.bootstrap) if args.bootstrap and g else {}
+        ci = bootstrap_ci(g, p, args.bootstrap) if args.bootstrap else {}
         counts = Counter(g)
+        rel = [hit_ok[j] for j in js if has_rel[j]]
+        h = fmt(sum(rel) / len(rel)) + f" (n={len(rel)})" if m != "rules" and rel else "–"
 
         def cell(k: str) -> str:
             v = fmt(s[k]) + (f" [{ci[k][0]:.2f}–{ci[k][1]:.2f}]" if k in ci else "")
             return v + (f" (low n={counts[k]})" if k in CLASSES and 0 < counts[k] < args.low_n else "")
-        lines.append(f"| {name} | {cell('macro')} | {cell('flaky')} | {cell('infra')} | {cell('regression')} "
-                     f"| {fmt(h) if h is not None else '–'} | {len(g)} |")
-    lines += [
+        return f"| {label} | {cell('macro')} | {cell('flaky')} | {cell('infra')} | {cell('regression')} | {h} | {len(g)} |"
+
+    header = ["| method | macro-F1 | F1 flaky | F1 infra | F1 regression | hit@5 | n |", "|---|---|---|---|---|---|---|"]
+    strong_only = lambda q: q["source"] != "regression_weak"  # noqa: E731
+    repos = sorted({q["repo"] for q in test})
+    dist = lambda xs: ", ".join(f"{c} {Counter(xs)[c]}" for c in CLASSES)  # noqa: E731
+    lines = [
+        f"# Fast-track results ({', '.join(r.split('/')[1] for r in repos)})",
+        "",
+        f"Input: `{args.inp.name}`" + (f", excluding {', '.join(sorted(exclude))}" if exclude else "")
+        + ". Unit: incident (matrix duplicates grouped), labeled incidents only "
+        "(regression_strong + regression_weak = regression; no test_bug labels exist).",
+        f"Label censoring: incidents after {censor:%Y-%m-%d %H:%M} UTC (latest job start {max_t:%Y-%m-%d} − "
+        f"{FIX_WINDOW_DAYS} days fix window) dropped ({len(all_incs) - len(incs)} of {len(all_incs)}), since their "
+        f"regression labels may not have appeared yet.",
+        (f"Time-based split per repo: for each repo, last {args.test_frac:.0%} of its incidents = test, train = its "
+         f"incidents before its test start − {args.gap_days} days; train and test pooled across repos, BM25 searches "
+         f"the pooled train (cross-repo retrieval). Test starts: "
+         + ", ".join(f"{r.split('/')[1]} {t:%Y-%m-%d}" for r, t in starts.items()) + "."
+         if args.split == "per-repo" else
+         f"Time-based split: last {args.test_frac:.0%} of incidents = test "
+         f"({test[0]['t']:%Y-%m-%d} – {test[-1]['t']:%Y-%m-%d}), train = incidents before test start − {args.gap_days} days."),
+        f"Train n={len(train)} ({dist([i['y'] for i in train])}); test n={len(test)} ({dist([q['y'] for q in test])}); "
+        f"test by repo: {', '.join(f'{r} {c}' for r, c in sorted(Counter(q['repo'] for q in test).items()))}.",
+        f"LLM: `{args.model}` (Gemini API free tier, temperature 0, default thinking: thinkingConfig is rejected by this model), BM25 top-{args.k} as context.",
+        "",
+        "## All test incidents",
+        "",
+        *header,
+        *[row(names[m], m, lambda q: True) for m in preds],
+        *[row(names[m] + " — regression_strong only (weak-labeled test incidents dropped)", m, strong_only) for m in preds],
+        "",
+        "## Per repo",
+        "",
+        *header,
+        *[row(f"{r.split('/')[1]}: {names[m]}", m, lambda q, r=r: q["repo"] == r) for r in repos for m in preds],
         "",
         f"hit@5: a retrieved train incident has the same fix commit or the same job + normalized first error line; "
-        f"computed only on test incidents with at least one such train incident ({len(hit)} of {len(test)} for BM25).",
+        f"computed only on test incidents with at least one such train incident (n in parentheses).",
         (f"Brackets: 95% bootstrap CI ({args.bootstrap} resamples of test incidents). " if args.bootstrap else "")
         + f"\"low n\": fewer than {args.low_n} test incidents of that class.",
-        "Scope: mpv, libavif and arrow only; pydantic, pytest and pytorch will be added when the main labeling "
-        "run finishes.",
+        llm_note,
+        f"Scope: {', '.join(repos)}." + (f" {args.note}" if args.note else ""),
         "Caveats: infra labels come from the same regex patterns the rules baseline uses, so rules F1 for infra is "
         "inflated by construction. flaky/regression labels come from rerun / later-commit metadata that is not in the "
         "log text.",
@@ -317,6 +400,38 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
+
+    if args.disagreements:
+        write_disagreements(args.disagreements, test, answers, args)
+
+
+def write_disagreements(path: Path, test: list[dict], answers: dict[int, tuple[str, str]], args) -> None:
+    """Gemini said infra, label says regression: 15 strong + 15 weak, random, with a verdict line to fill in."""
+    rng = random.Random(0)
+    pick = []
+    for src in ("regression_strong", "regression_weak"):
+        js = [j for j, (c, _) in sorted(answers.items()) if c == "infra" and test[j]["source"] == src]
+        pick += [(src, j) for j in sorted(rng.sample(js, min(15, len(js))))]
+    out = [f"# Gemini says infra, label says regression ({len(pick)} cases)", "",
+           f"From `{args.out.name}` (model `{args.model}`). Random sample, seed 0: up to 15 regression_strong + "
+           "15 regression_weak test incidents where Gemini answered infra.",
+           "For each case fill in the verdict: label correct / Gemini correct / unclear.", ""]
+    for n, (src, j) in enumerate(pick, 1):
+        q = test[j]
+        fixes = "\n".join(f"- https://github.com/{q['repo']}/commit/{sha} (fix run "
+                          f"https://github.com/{q['repo']}/actions/runs/{q['fix_runs'][sha]})" for sha in sorted(q["fixes"]))
+        out += [f"## {n}. {q['repo']} · {src}", "",
+                f"- incident `{q['id']}` · {q['t']:%Y-%m-%d %H:%M} UTC · {q['n_jobs']} job(s) · {q['url']}",
+                f"- job: `{q['job']}`",
+                f"- failed steps: {', '.join(q['steps']) or '–'}",
+                f"- Gemini likely_cause: {answers[j][1]}",
+                f"- fix commit(s):\n{fixes}",
+                f"- touched files: {', '.join(q['files']) or '–'}", "",
+                "Failure region (last 25 normalized lines):", "", "```",
+                *[l[:220] for l in q["region"][-25:]], "```", "",
+                "**verdict: ___**", ""]
+    path.write_text("\n".join(out) + "\n")
+    print(f"wrote {len(pick)} cases to {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
