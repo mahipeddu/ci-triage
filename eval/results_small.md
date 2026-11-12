@@ -1,3 +1,5 @@
+Superseded by results_no_pytorch.md (per-repo split, temporal retrieval, aggregator exclusion).
+
 # Fast-track results (libavif, arrow, mpv)
 
 Input: `failures_labeled_small.jsonl`. Unit: incident (matrix duplicates grouped), labeled incidents only (regression_strong + regression_weak = regression; no test_bug labels exist).

@@ -10,6 +10,7 @@ Usage: python -m collect.label
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -28,6 +29,27 @@ RECENT_DAYS = 3
 FIX_WINDOW_DAYS = 14  # look for a fixing commit this long after the failure
 MAX_LATER_RUNS = 20
 REGION_LINES = 30  # lines before each ##[error] that form the failure region
+
+# jobs that only report other jobs' status: their failure duplicates the real incident -> not labeled
+AGGREGATOR_STEP = "Decide whether the needed jobs succeeded or failed"  # re-actors/alls-green
+META_JOBS = {"apache/arrow": {"PR Workflow bot"}}  # bot workflows, not CI test/build failures
+
+# fix relevance: a regression fix should touch a file sharing a module token with the failing tests / error lines
+FIX_STOP = set("""
+error errors fail failed failure failures fatal warning test tests testing unittest unittests timeout timed exit code
+process completed running run runs line lines file files src source sources lib libs include includes cpp python
+the and for with from not none true false assert assertion assertionerror exception traceback most recent call last
+build builds building make ninja cmake cmakelists lists txt main master common internal util utils core tool tools
+script scripts github workflows workflow yml yaml json toml cfg ini docs doc readme changelog hpp cc py rs go js ts md
+rst ci home runner work usr local opt var tmp users bin share site packages dist lib64 venv env sec proc passed total
+real summary label time following while ctest pytest raise raised expected got value values self args kwargs def
+return err out stdout stderr status subcommand stopped job step steps setup install installing check checks type types
+mpv avif libavif arrow apache pyarrow pydantic pytest torch pytorch
+""".split())
+FIX_EXT = {"c", "h", "cc", "cpp", "hpp", "py", "pyi", "pyx", "pxd", "rs", "go", "js", "ts", "md", "rst", "txt", "yml",
+           "yaml", "json", "toml", "cfg", "ini", "sh", "cmake", "build", "in", "lock"}
+CTEST_FAIL = re.compile(r"\*\*\*(Failed|Timeout|Exception)|\((Failed|Timeout|SEGFAULT|Subprocess aborted|Child aborted)\)")
+CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 CONFIDENCE = {"disabled_issue": "high", "rerun": "medium", "infra": "medium",
               "regression_strong": "medium", "regression_weak": "low"}
@@ -319,6 +341,48 @@ def find_fix(rec: dict) -> tuple[dict | None, int]:
     return None, len(seen_failed)
 
 
+def is_aggregator(rec: dict) -> bool:
+    return AGGREGATOR_STEP in rec["failed_steps"] or rec["job_name"] in META_JOBS.get(rec["repo"], ())
+
+
+def module_tokens(s: str) -> set[str]:
+    out = set()
+    for part in re.split(r"[^A-Za-z0-9]+", s):
+        for t in CAMEL.split(part):
+            t = t.lower()
+            if len(t) >= 3 and not t.isdigit() and t not in FIX_STOP and t not in FIX_EXT:
+                out.add(t)
+    return out
+
+
+def fix_relevant(text: str, files: list[str]) -> bool | None:
+    """True if a touched file shares a module token with the failing tests / error lines of the failure region,
+    False if both sides have tokens but none shared, None if undecidable. (The whole region is not used:
+    e.g. ctest's label time summary lists every module in every run.)"""
+    lines = text.splitlines()
+    fail = set()
+    for l in failure_region(lines):
+        s = strip(l)
+        if (ERRLINE.search(s) or CTEST_FAIL.search(s)) and "label time summary" not in s.lower():
+            fail |= module_tokens(s)
+    for (test, cls), evs in testlog.scan(lines).items():
+        if testlog.failed(evs) and not testlog.passed(evs):
+            fail |= module_tokens(test) | module_tokens(cls)
+    fix = set().union(*(module_tokens(f) for f in files)) if files else set()
+    return None if not fail or not fix else bool(fail & fix)
+
+
+def refresh_derived(rec: dict) -> dict:
+    """Re-apply the API-free rules (aggregator exclusion, fix_relevant) to an already labeled record."""
+    if is_aggregator(rec):
+        return {**rec, "label": None, "label_source": "aggregator", "confidence": None, "label_meta": None}
+    if (rec["label"] or "").startswith("regression") and rec["log_path"]:
+        meta = {**rec["label_meta"], "fix_relevant": fix_relevant(read_log(rec["log_path"]),
+                                                                  rec["label_meta"]["touched_files"])}
+        return {**rec, "label_meta": meta}
+    return rec
+
+
 def label(rec: dict, issues: dict, now: datetime) -> dict:
     text = read_log(rec["log_path"]) if rec["log_path"] else ""
     region = failure_region(text.splitlines())
@@ -330,6 +394,8 @@ def label(rec: dict, issues: dict, now: datetime) -> dict:
     def lab(label: str, source: str, meta: dict) -> dict:
         return {**rec, "label": label, "label_source": source, "confidence": CONFIDENCE[source], "label_meta": meta}
 
+    if is_aggregator(rec):
+        return {**rec, "label_source": "aggregator"}
     if ts(rec["run_created_at"]) > now - timedelta(days=RECENT_DAYS):
         return {**rec, "label_source": "too_recent"}
     try:
@@ -353,7 +419,8 @@ def label_rules(rec: dict, text: str, issues: dict, infra, lab) -> dict:
         strong = later_failed > 0 or prev_failed or rerun_failed
         kind = "regression_strong" if strong else "regression_weak"
         return lab(kind, kind, {**fix, "later_failed_commits": later_failed,
-                                "prev_commit_failed": prev_failed, "rerun_failed": rerun_failed})
+                                "prev_commit_failed": prev_failed, "rerun_failed": rerun_failed,
+                                "fix_relevant": fix_relevant(text, fix["touched_files"])})
     return rec
 
 
@@ -365,6 +432,8 @@ def main() -> None:
     ap.add_argument("--tests-out", type=Path, default=ROOT / "data/processed/pytorch_test_failures.jsonl",
                     help="per-test traceback records for failed pytorch jobs")
     ap.add_argument("--repos", nargs="*", help="only label these repos")
+    ap.add_argument("--refresh-derived", action="store_true",
+                    help="no API calls: re-apply aggregator exclusion + fix_relevant to the existing --out file")
     ap.add_argument("--examples", type=int, default=5, help="infra example matches to print per pattern")
     args = ap.parse_args()
 
@@ -380,7 +449,16 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     out = []
     n_tests = 0
-    with args.out.open("w") as f, args.tests_out.open("w") as ft:
+    if args.refresh_derived:
+        out = [refresh_derived(json.loads(l)) for l in args.out.open()]
+        if args.repos:
+            out = [r for r in out if r["repo"] in args.repos]
+        tmp = args.out.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in out))
+        tmp.replace(args.out)
+        recs = []
+    with (open(os.devnull, "w") if args.refresh_derived else args.out.open("w")) as f, \
+            (open(os.devnull, "w") if args.refresh_derived else args.tests_out.open("w")) as ft:
         for i, r in enumerate(recs, 1):
             out.append(label(r, issues, now))
             f.write(json.dumps(out[-1]) + "\n")
@@ -391,7 +469,8 @@ def main() -> None:
             if i % 200 == 0 or i == len(recs):
                 print(f"{datetime.now():%H:%M:%S} labeled {i}/{len(recs)}", file=sys.stderr, flush=True)
 
-    print(f"wrote {n_tests} pytorch per-test failure records to {args.tests_out}", file=sys.stderr)
+    if not args.refresh_derived:
+        print(f"wrote {n_tests} pytorch per-test failure records to {args.tests_out}", file=sys.stderr)
     print("== infra pattern matches (all jobs, before precedence / recency) ==")
     by_pat = defaultdict(list)
     for r in out:

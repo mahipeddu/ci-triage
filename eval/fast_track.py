@@ -51,13 +51,16 @@ def incidents(path: Path, max_lines: int, exclude: set[str] = frozenset()) -> li
         fixes = {j["label_meta"]["fix_sha"] for j in jobs if j["label"].startswith("regression")}
         fix_runs = {j["label_meta"]["fix_sha"]: j["label_meta"]["fix_run_id"] for j in jobs
                     if j["label"].startswith("regression")}
+        rel = [j["label_meta"].get("fix_relevant") for j in jobs if j["label"].startswith("regression")]
+        fix_rel = True if True in rel else False if False in rel else None
         out.append({"id": inc, "repo": repo, "t": ts(rep["job_started_at"]), "y": next(iter(classes)),
                     "source": rep["label_source"], "job": rep["job_name"], "steps": rep["failed_steps"],
                     "sig": (rep["job_name"], region[0] if region else ""), "fixes": fixes,
                     "files": sorted({f for j in jobs if j["label"].startswith("regression")
                                      for f in j["label_meta"]["touched_files"]})[:10],
                     "text": f"job: {rep['job_name']}\nfailed steps: {', '.join(rep['failed_steps'])}\n" + "\n".join(region),
-                    "n_jobs": len(jobs), "region": region, "url": rep["html_url"], "fix_runs": fix_runs})
+                    "n_jobs": len(jobs), "region": region, "url": rep["html_url"], "fix_runs": fix_runs,
+                    "fix_relevant": fix_rel})
     return sorted(out, key=lambda i: i["t"])
 
 
@@ -80,7 +83,7 @@ def per_repo_split(incs: list[dict], test_frac: float, gap_days: int) -> tuple[l
 
 # ---------- retrieval ----------
 
-def bm25_index(docs: list[str], k1: float = 1.5, b: float = 0.75):
+def bm25_index(docs: list[str], times: list | None = None, k1: float = 1.5, b: float = 0.75):
     toks = [TOKEN.findall(d.lower()) for d in docs]
     df = Counter(t for ts_ in toks for t in set(ts_))
     n, avg = len(toks), sum(map(len, toks)) / max(len(toks), 1)
@@ -88,10 +91,12 @@ def bm25_index(docs: list[str], k1: float = 1.5, b: float = 0.75):
     tfs = [Counter(t) for t in toks]
     lens = [len(t) for t in toks]
 
-    def search(q: str, k: int) -> list[tuple[int, float]]:
+    def search(q: str, k: int, before=None) -> list[tuple[int, float]]:
+        """top-k train docs; with before, only docs whose time < before (no retrieval from the future)."""
         qt = set(TOKEN.findall(q.lower()))
         scores = [(i, sum(idf[t] * tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * lens[i] / avg))
-                          for t in qt if t in tf)) for i, tf in enumerate(tfs)]
+                          for t in qt if t in tf)) for i, tf in enumerate(tfs)
+                  if before is None or times is None or times[i] < before]
         return sorted(scores, key=lambda s: -s[1])[:k]
     return search
 
@@ -284,9 +289,9 @@ def main() -> None:
     if args.counts_only:
         return
     majority = Counter(i["y"] for i in train).most_common(1)[0][0]
-    search = bm25_index([i["text"] for i in train])
-    hits = [search(q["text"], args.k) for q in test]
-    has_rel = [any(relevant(q, d) for d in train) for q in test]
+    search = bm25_index([i["text"] for i in train], [i["t"] for i in train])
+    hits = [search(q["text"], args.k, before=q["t"]) for q in test]  # only train incidents older than the query
+    has_rel = [any(relevant(q, d) and d["t"] < q["t"] for d in train) for q in test]
     hit_ok = [any(relevant(q, train[i]) for i, _ in h) for q, h in zip(test, hits)]
 
     preds: dict[str, dict[int, str]] = {
@@ -336,8 +341,10 @@ def main() -> None:
     def fmt(x: float) -> str:
         return "–" if x != x else f"{x:.3f}"
 
-    def row(label: str, m: str, keep) -> str:
-        js = [j for j in preds[m] if keep(test[j])]
+    sample = set(preds.get("llm", {}))  # the incidents Gemini saw
+
+    def row(label: str, m: str, keep, same_sample: bool = False) -> str:
+        js = [j for j in preds[m] if keep(test[j]) and (not same_sample or j in sample)]
         g, p = [test[j]["y"] for j in js], [preds[m][j] for j in js]
         if not g:
             return f"| {label} | – | – | – | – | – | 0 |"
@@ -352,8 +359,33 @@ def main() -> None:
             return v + (f" (low n={counts[k]})" if k in CLASSES and 0 < counts[k] < args.low_n else "")
         return f"| {label} | {cell('macro')} | {cell('flaky')} | {cell('infra')} | {cell('regression')} | {h} | {len(g)} |"
 
+    paired_lines = []
+    if sample and args.bootstrap:
+        js = sorted(sample)
+        g = [test[j]["y"] for j in js]
+        gp, kp = [preds["llm"][j] for j in js], [preds["knn"][j] for j in js]
+        rng = random.Random(1)
+        diffs: dict[str, list[float]] = defaultdict(list)
+        for _ in range(args.bootstrap):
+            idx = [rng.randrange(len(js)) for _ in js]
+            a = f1s([g[i] for i in idx], [gp[i] for i in idx])
+            b = f1s([g[i] for i in idx], [kp[i] for i in idx])
+            for k in ("macro", "flaky"):
+                if a[k] == a[k] and b[k] == b[k]:
+                    diffs[k].append(a[k] - b[k])
+        full_a, full_b = f1s(g, gp), f1s(g, kp)
+        paired_lines = ["Paired bootstrap, Gemini − BM25 kNN on the same incidents "
+                        f"(n={len(js)}, {args.bootstrap} resamples):", ""]
+        for k in ("macro", "flaky"):
+            d = sorted(diffs[k])
+            paired_lines.append(
+                f"- {k}-F1 difference: {full_a[k] - full_b[k]:+.3f} "
+                f"[{d[int(0.025 * len(d))]:+.3f} – {d[min(len(d) - 1, int(0.975 * len(d)))]:+.3f}], "
+                f"share of resamples with difference ≤ 0: {sum(x <= 0 for x in d) / len(d):.2f}")
     header = ["| method | macro-F1 | F1 flaky | F1 infra | F1 regression | hit@5 | n |", "|---|---|---|---|---|---|---|"]
     strong_only = lambda q: q["source"] != "regression_weak"  # noqa: E731
+    fix_rel_only = lambda q: q["y"] != "regression" or q["fix_relevant"] is True  # noqa: E731
+    base = [m for m in preds if m != "llm"]
     repos = sorted({q["repo"] for q in test})
     dist = lambda xs: ", ".join(f"{c} {Counter(xs)[c]}" for c in CLASSES)  # noqa: E731
     lines = [
@@ -380,13 +412,23 @@ def main() -> None:
         "",
         *header,
         *[row(names[m], m, lambda q: True) for m in preds],
+        *([row(names[m] + " — same 150 incidents as Gemini", m, lambda q: True, True) for m in base] if sample else []),
         *[row(names[m] + " — regression_strong only (weak-labeled test incidents dropped)", m, strong_only) for m in preds],
+        *[row(names[m] + " — fix_relevant=true only (regression incidents whose fix fails the relevance check dropped)",
+              m, fix_rel_only) for m in preds],
+        *([row(names[m] + " — fix_relevant=true only, same incidents as Gemini", m, fix_rel_only, True)
+           for m in base] if sample else []),
+        "",
+        *paired_lines,
         "",
         "## Per repo",
         "",
         *header,
-        *[row(f"{r.split('/')[1]}: {names[m]}", m, lambda q, r=r: q["repo"] == r) for r in repos for m in preds],
+        *[row(f"{r.split('/')[1]}: {names[m]}" + (" (Gemini's incidents)" if m != "llm" and sample else ""), m,
+              lambda q, r=r: q["repo"] == r, same_sample=bool(sample)) for r in repos for m in preds],
         "",
+        "Retrieval is temporal: BM25 only returns train incidents older than the test incident (no cross-repo "
+        "future leak), and hit@5 only counts such older train incidents.",
         f"hit@5: a retrieved train incident has the same fix commit or the same job + normalized first error line; "
         f"computed only on test incidents with at least one such train incident (n in parentheses).",
         (f"Brackets: 95% bootstrap CI ({args.bootstrap} resamples of test incidents). " if args.bootstrap else "")
