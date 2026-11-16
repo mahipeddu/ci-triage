@@ -89,16 +89,26 @@ def main() -> None:
         cell = lambda k: fmt(s[k]) + (f" [{ci[k][0]:.2f}–{ci[k][1]:.2f}]" if k in ci else "")  # noqa: E731
         lines.append(f"| {name} | {len(js)} | {cell('macro')} | {cell('flaky')} | {cell('infra')} | {cell('regression')} |")
     lines += ["", f"Test classes in the sample: {dict(Counter(gold.values()))}.", "",
+              "Predicted class counts (false positives = predicted that class, gold is another class):", "",
+              "| method | " + " | ".join(f"predicted {c} (false positives)" for c in CLASSES) + " |",
+              "|---|---|---|---|"]
+    for name, p in preds.items():
+        lines.append(f"| {name} | " + " | ".join(
+            f"{sum(v == c for v in p.values())} ({sum(v == c and gold[j] != c for j, v in p.items())})"
+            for c in CLASSES) + " |")
+    lines += ["",
               "## Paired differences (same incidents)", "", "| comparison | n | Δ macro-F1 | Δ flaky F1 |", "|---|---|---|---|"]
     tname = f"teacher {args.teacher_model} v1"
-    for sname in students:
-        for other in ("BM25 kNN", tname):
-            js = sorted(set(preds[f"student {sname}"]) & set(preds[other]))
-            d = paired([gold[j] for j in js], [preds[f"student {sname}"][j] for j in js], [preds[other][j] for j in js])
-            star = lambda t: " *" if t[1] > 0 or t[2] < 0 else ""  # noqa: E731
-            lines.append(f"| student {sname} − {other} | {len(js)} | {d['macro'][0]:+.3f} [{d['macro'][1]:+.2f}, "
-                         f"{d['macro'][2]:+.2f}]{star(d['macro'])} | {d['flaky'][0]:+.3f} [{d['flaky'][1]:+.2f}, "
-                         f"{d['flaky'][2]:+.2f}]{star(d['flaky'])} |")
+    names = list(students)
+    pairs = [(f"student {s}", o) for s in names for o in ("BM25 kNN", tname)]
+    pairs += [(f"student {b}", f"student {a}") for i, a in enumerate(names) for b in names[i + 1:]]
+    for a_name, other in pairs:
+        js = sorted(set(preds[a_name]) & set(preds[other]))
+        d = paired([gold[j] for j in js], [preds[a_name][j] for j in js], [preds[other][j] for j in js])
+        star = lambda t: " *" if t[1] > 0 or t[2] < 0 else ""  # noqa: E731
+        lines.append(f"| {a_name} − {other} | {len(js)} | {d['macro'][0]:+.3f} [{d['macro'][1]:+.2f}, "
+                     f"{d['macro'][2]:+.2f}]{star(d['macro'])} | {d['flaky'][0]:+.3f} [{d['flaky'][1]:+.2f}, "
+                     f"{d['flaky'][2]:+.2f}]{star(d['flaky'])} |")
     lines += ["", "\\* = CI excludes 0.", ""]
 
     for sname, recs in students.items():

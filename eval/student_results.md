@@ -12,6 +12,16 @@ Split, censoring, aggregator exclusion and temporal BM25 retrieval as in `result
 
 Test classes in the sample: {'regression': 121, 'flaky': 19, 'infra': 10}.
 
+Predicted class counts (false positives = predicted that class, gold is another class):
+
+| method | predicted flaky (false positives) | predicted infra (false positives) | predicted regression (false positives) |
+|---|---|---|---|
+| BM25 kNN | 18 (6) | 6 (2) | 126 (12) |
+| teacher gemini-3.5-flash-lite v1 | 23 (8) | 39 (30) | 88 (3) |
+| student labels | 32 (19) | 7 (1) | 111 (7) |
+| student rationale | 18 (5) | 17 (7) | 115 (5) |
+| student rationale+rationalized | 25 (12) | 13 (5) | 112 (5) |
+
 ## Paired differences (same incidents)
 
 | comparison | n | Δ macro-F1 | Δ flaky F1 |
@@ -22,6 +32,9 @@ Test classes in the sample: {'regression': 121, 'flaky': 19, 'infra': 10}.
 | student rationale − teacher gemini-3.5-flash-lite v1 | 150 | +0.160 [+0.09, +0.24] * | -0.012 [-0.15, +0.11] |
 | student rationale+rationalized − BM25 kNN | 150 | +0.044 [-0.07, +0.17] | -0.058 [-0.16, +0.05] |
 | student rationale+rationalized − teacher gemini-3.5-flash-lite v1 | 150 | +0.103 [+0.01, +0.18] * | -0.123 [-0.26, +0.00] |
+| student rationale − student labels | 150 | +0.088 [-0.03, +0.22] | +0.193 [+0.07, +0.33] * |
+| student rationale+rationalized − student labels | 150 | +0.031 [-0.06, +0.14] | +0.081 [-0.04, +0.20] |
+| student rationale+rationalized − student rationale | 150 | -0.057 [-0.15, +0.00] | -0.112 [-0.20, -0.04] * |
 
 \* = CI excludes 0.
 
