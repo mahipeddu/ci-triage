@@ -216,6 +216,27 @@ def worked_examples(train: list[dict], seed: int = 0) -> str:
     return "\n\n".join(out)
 
 
+def build_prompt(q: dict, train: list[dict], hits: list[tuple[int, float]], version: str = "v1",
+                 examples: str = "", ctx_chars: int = 1500) -> str:
+    """The RAG prompt for incident q with retrieved train incidents (shared by teacher, student and eval).
+    ctx_chars caps each retrieved incident's log text (the new failure itself is capped separately at 6000)."""
+    ctx = "\n\n".join(
+        f"[{train[i]['id']}] category={train[i]['y']} (label source: {train[i]['source']})"
+        f"{' fix touched: ' + ', '.join(train[i]['files']) if train[i]['files'] else ''}\n{train[i]['text'][:ctx_chars]}"
+        for i, _ in hits)
+    if version == "v2":
+        return PROMPT_V2.format(repo=q["repo"], text=q["text"][:6000], context=ctx, examples=examples)
+    return PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx)
+
+
+def load_split(inp: Path, exclude: set[str], test_frac: float, gap_days: int, max_lines: int = 80):
+    """Censored per-repo time split, as used by the eval: (train, test)."""
+    max_t = max(ts(r["job_started_at"]) for r in map(json.loads, inp.open()) if r["repo"] not in exclude)
+    incs = [i for i in incidents(inp, max_lines, exclude) if i["t"] <= max_t - timedelta(days=FIX_WINDOW_DAYS)]
+    train, test, _ = per_repo_split(incs, test_frac, gap_days)
+    return train, test
+
+
 def cache_path(prompt: str, model: str) -> Path:
     return LLM_CACHE / (hashlib.sha1(f"{model}\n{prompt}".encode()).hexdigest() + ".json")
 
@@ -241,6 +262,7 @@ def gemini(prompt: str, model: str, min_interval: float, state: dict) -> dict | 
             msg = r.text.lower()
             if "per day" in msg or "perday" in msg:
                 print("  Gemini daily quota exhausted; rerun later to resume from cache", file=sys.stderr)
+                state["quota"] = True
                 return None
             time.sleep(30 * (attempt + 1))
             continue
@@ -391,12 +413,7 @@ def main() -> None:
         print(f"{time.strftime('%H:%M:%S')} gemini 0/{len(idx)}", file=sys.stderr, flush=True)
         for n, j in enumerate(idx, 1):
             q = test[j]
-            ctx = "\n\n".join(
-                f"[{train[i]['id']}] category={train[i]['y']} (label source: {train[i]['source']})"
-                f"{' fix touched: ' + ', '.join(train[i]['files']) if train[i]['files'] else ''}\n{train[i]['text'][:1500]}"
-                for i, _ in hits[j])
-            prompt = (PROMPT_V2.format(repo=q["repo"], text=q["text"][:6000], context=ctx, examples=examples)
-                      if args.prompt == "v2" else PROMPT.format(repo=q["repo"], text=q["text"][:6000], context=ctx))
+            prompt = build_prompt(q, train, hits[j], args.prompt, examples)
             if args.cache_only and not cache_path(prompt, args.model).exists():
                 missing += 1
                 continue

@@ -9,7 +9,9 @@ from pathlib import Path
 
 from collect.github_logs import ROOT
 
-PROGRESS = re.compile(r"^\s*(\d\d:\d\d:\d\d) (?:labeled|refetched|gemini) (\d+)/(\d+)")
+PROGRESS = re.compile(r"^\s*(\d\d:\d\d:\d\d) (?:labeled|refetched|gemini|teacher|rationalized|step|predicted) (\d+)/(\d+)")
+MODEL_BYTES = 8.05e9  # Qwen3-4B-Instruct-2507 safetensors
+HUB = Path.home() / ".cache/huggingface/hub"
 
 
 def progress(log: Path, start_marker: str | None = None) -> list[tuple[datetime, int, int]]:
@@ -53,6 +55,54 @@ def bar(name: str, pts: list[tuple[datetime, int, int]], state: str) -> str:
     return f"{name:34} [{'#' * fill}{'.' * (width - fill)}] {done:5}/{total:<5} {100 * done / total:5.1f}%{eta}"
 
 
+def read(p: Path) -> str:
+    return p.read_text(errors="replace") if p.exists() else ""
+
+
+def distill_rows(data: Path) -> None:
+    dl = read(data / "models/download.log")
+    if "DOWNLOADED" in dl:
+        print(f"{'distill: student model download':34} done")
+    elif dl:
+        recent = datetime.now().timestamp() - 300
+        got = sum(f.stat().st_size for f in HUB.glob("models--Qwen--Qwen3-4B-Instruct-2507/blobs/*.incomplete")
+                  if f.stat().st_mtime >= recent)  # active partials only; stale ones from a stalled attempt ignored
+        done = sum(f.stat().st_size for f in HUB.glob("models--Qwen--Qwen3-4B-Instruct-2507/blobs/*")
+                   if not f.name.endswith(".incomplete") and f.stat().st_size > 1e8)
+        gb = (got + done) / 1e9
+        fill = min(30, int(30 * gb * 1e9 / MODEL_BYTES))
+        print(f"{'distill: student model download':34} [{'#' * fill}{'.' * (30 - fill)}] {gb:4.1f}/{MODEL_BYTES / 1e9:.1f} GB")
+    tl = read(data / "teacher_data.log")
+    lines = tl.splitlines()
+    last = next((l for l in reversed(lines) if re.search(r"teacher \d+/|rationalized \d+/|quota: sleeping|DONE|FAILED", l)), "")
+    pts = progress(data / "teacher_data.log")
+    teacher_pts = [p for p, l in zip(pts, [l for l in lines if PROGRESS.match(l)]) if " teacher " in l]
+    rat_pts = [p for p, l in zip(pts, [l for l in lines if PROGRESS.match(l)]) if " rationalized " in l]
+    main_done = "main pass complete" in tl
+    paused = (m := re.search(r"sleeping until (.+?) \w{3} \w{3} \d+ [\d:]+ [AP]M", last)) and m[1]
+    kept = next((l for l in reversed(lines) if l.startswith("kept/dropped")), "")
+    state = "done" if main_done else (f"paused: daily quota, resumes {paused} "
+                                      f"({teacher_pts[-1][1]}/{teacher_pts[-1][2]})" if paused and teacher_pts else "")
+    print(bar("distill: teacher data (train)", teacher_pts, state))
+    if kept:
+        print(f"{'':34} {kept}")
+    if main_done or rat_pts:
+        rs = "done" if "TEACHER DATA COMPLETE" in tl else (f"paused: daily quota, resumes {paused}" if paused else "")
+        print(bar("distill: rationalization", rat_pts, rs))
+    for name in ("labels", "rationale", "rationale_rationalized"):
+        log = data / f"models/student_{name}/train.log"
+        if log.exists():
+            st = read(log)
+            print(bar(f"distill: student {name} training", progress(log),
+                      "done" if "TRAIN DONE" in st else "FAILED" if "Traceback" in st else ""))
+        plog = data / f"models/predict_{name}.log"
+        if plog.exists():
+            pt = read(plog)
+            print(bar(f"distill: student {name} predict (150)", progress(plog),
+                      "done" if "PREDICT DONE" in pt else "FAILED" if "FAILED" in pt or "Traceback" in pt
+                      else "" if "start predict" in pt else "after training"))
+
+
 def main() -> None:
     argparse.ArgumentParser(description=__doc__).parse_args()
     data = ROOT / "data"
@@ -68,6 +118,7 @@ def main() -> None:
     ev = (data / "eval_small.log").read_text(errors="replace") if (data / "eval_small.log").exists() else ""
 
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S}")
+    distill_rows(data)
     print(bar("main: pytorch log re-download", progress(data / "collect.log", "restart"), refetch))
     print(bar("main: labeling (all repos)", progress(data / "collect.log", "refetch done") if "refetch done" in tail
               else [], labeling or ("" if "refetch done" in tail else "after re-download")))
