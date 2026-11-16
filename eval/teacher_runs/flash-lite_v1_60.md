@@ -12,15 +12,15 @@ LLM: `gemini-3.5-flash-lite` (Gemini API free tier, temperature 0, default think
 |---|---|---|---|---|---|---|
 | rules (infra patterns, flaky keywords, else train majority) | 0.614 [0.54–0.68] | 0.222 [0.07–0.36] | 0.714 [0.53–0.86] | 0.904 [0.88–0.93] | – | 361 |
 | BM25 kNN (k=5, majority vote) | 0.671 [0.58–0.74] | 0.522 [0.37–0.66] | 0.571 [0.37–0.74] | 0.920 [0.89–0.94] | 0.973 (n=111) | 361 |
-| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.538 [0.39–0.69] | 0.500 [0.15–0.78] (low n=7) | 0.348 [0.10–0.59] (low n=4) | 0.765 [0.66–0.87] | 0.941 (n=17) | 60 |
+| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.538 [0.39–0.68] | 0.500 [0.15–0.78] (low n=7) | 0.348 [0.11–0.58] (low n=4) | 0.765 [0.65–0.86] | 0.941 (n=17) | 60 |
 | rules (infra patterns, flaky keywords, else train majority) — same 150 incidents as Gemini | 0.657 [0.44–0.80] | 0.200 [0.00–0.56] (low n=7) | 0.857 [0.33–1.00] (low n=4) | 0.913 [0.85–0.96] | – | 60 |
 | BM25 kNN (k=5, majority vote) — same 150 incidents as Gemini | 0.661 [0.44–0.82] | 0.333 [0.00–0.67] (low n=7) | 0.750 [0.00–1.00] (low n=4) | 0.900 [0.84–0.96] | 0.941 (n=17) | 60 |
 | rules (infra patterns, flaky keywords, else train majority) — regression_strong only (weak-labeled test incidents dropped) | 0.622 [0.53–0.70] | 0.275 [0.11–0.43] | 0.714 [0.53–0.86] | 0.877 [0.84–0.91] | – | 237 |
 | BM25 kNN (k=5, majority vote) — regression_strong only (weak-labeled test incidents dropped) | 0.680 [0.59–0.76] | 0.581 [0.43–0.73] | 0.571 [0.36–0.74] | 0.886 [0.85–0.92] | 0.986 (n=73) | 237 |
-| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample — regression_strong only (weak-labeled test incidents dropped) | 0.620 [0.43–0.79] | 0.615 [0.20–0.91] (low n=7) | 0.444 [0.12–0.71] (low n=4) | 0.800 [0.67–0.90] | 0.917 (n=12) | 43 |
+| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample — regression_strong only (weak-labeled test incidents dropped) | 0.620 [0.45–0.79] | 0.615 [0.22–0.89] (low n=7) | 0.444 [0.13–0.71] (low n=4) | 0.800 [0.67–0.91] | 0.917 (n=12) | 43 |
 | rules (infra patterns, flaky keywords, else train majority) — fix_relevant=true only (regression incidents whose fix fails the relevance check dropped) | 0.601 [0.52–0.69] | 0.275 [0.11–0.43] | 0.714 [0.53–0.86] | 0.816 [0.76–0.87] | – | 174 |
 | BM25 kNN (k=5, majority vote) — fix_relevant=true only (regression incidents whose fix fails the relevance check dropped) | 0.677 [0.58–0.76] | 0.590 [0.42–0.72] | 0.600 [0.40–0.77] | 0.842 [0.79–0.89] | 1.000 (n=38) | 174 |
-| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample — fix_relevant=true only (regression incidents whose fix fails the relevance check dropped) | 0.688 [0.49–0.86] | 0.615 [0.22–0.89] (low n=7) | 0.615 [0.20–0.86] (low n=4) | 0.833 [0.67–0.95] | 1.000 (n=6) | 31 |
+| gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample — fix_relevant=true only (regression incidents whose fix fails the relevance check dropped) | 0.688 [0.48–0.86] | 0.615 [0.20–0.89] (low n=7) | 0.615 [0.20–0.89] (low n=4) | 0.833 [0.67–0.95] | 1.000 (n=6) | 31 |
 | rules (infra patterns, flaky keywords, else train majority) — fix_relevant=true only, same incidents as Gemini | 0.653 [0.37–0.84] | 0.250 [0.00–0.67] (low n=7) | 0.857 [0.00–1.00] (low n=4) | 0.851 [0.73–0.94] | – | 31 |
 | BM25 kNN (k=5, majority vote) — fix_relevant=true only, same incidents as Gemini | 0.701 [0.48–0.87] | 0.400 [0.00–0.75] (low n=7) | 0.857 [0.40–1.00] (low n=4) | 0.844 [0.72–0.95] | 1.000 (n=6) | 31 |
 
@@ -41,19 +41,19 @@ Paired bootstrap, Gemini − BM25 kNN on the same incidents, fix_relevant=true o
 |---|---|---|---|---|---|---|
 | libavif: rules (infra patterns, flaky keywords, else train majority) (Gemini's incidents) | 0.455 [0.37–1.00] | 0.000 [0.00–0.00] (low n=2) | – | 0.909 [0.74–1.00] (low n=10) | – | 12 |
 | libavif: BM25 kNN (k=5, majority vote) (Gemini's incidents) | 0.621 [0.37–1.00] | 0.400 [0.00–0.86] (low n=2) | – | 0.842 [0.67–1.00] (low n=10) | 1.000 (n=1) | 12 |
-| libavif: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.778 [0.56–1.00] | 0.667 [0.00–1.00] (low n=2) | – | 0.889 [0.71–1.00] (low n=10) | 1.000 (n=1) | 12 |
+| libavif: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.778 [0.56–1.00] | 0.667 [0.00–1.00] (low n=2) | – | 0.889 [0.67–1.00] (low n=10) | 1.000 (n=1) | 12 |
 | arrow: rules (infra patterns, flaky keywords, else train majority) (Gemini's incidents) | 0.455 [0.37–1.00] | 0.000 [0.00–0.00] (low n=2) | – | 0.909 [0.74–1.00] (low n=10) | – | 12 |
 | arrow: BM25 kNN (k=5, majority vote) (Gemini's incidents) | 0.671 [0.33–1.00] | 0.500 [0.00–1.00] (low n=2) | 0.000 [0.00–0.00] | 0.842 [0.62–1.00] (low n=10) | 0.667 (n=3) | 12 |
-| arrow: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.625 [0.31–0.93] | 0.500 [0.00–1.00] (low n=2) | 0.000 [0.00–0.00] | 0.750 [0.43–0.95] (low n=10) | 0.667 (n=3) | 12 |
+| arrow: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.625 [0.27–0.92] | 0.500 [0.00–1.00] (low n=2) | 0.000 [0.00–0.00] | 0.750 [0.40–0.95] (low n=10) | 0.667 (n=3) | 12 |
 | mpv: rules (infra patterns, flaky keywords, else train majority) (Gemini's incidents) | 0.517 [0.22–0.91] | 0.000 [0.00–0.00] (low n=2) | 0.800 [0.00–1.00] (low n=3) | 0.750 [0.46–0.95] (low n=7) | – | 12 |
 | mpv: BM25 kNN (k=5, majority vote) (Gemini's incidents) | 0.541 [0.25–1.00] | 0.000 [0.00–0.00] (low n=2) | 0.800 [0.00–1.00] (low n=3) | 0.824 [0.57–1.00] (low n=7) | – | 12 |
-| mpv: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.382 [0.18–0.71] | 0.000 [0.00–0.00] (low n=2) | 0.600 [0.00–0.89] (low n=3) | 0.545 [0.00–0.83] (low n=7) | – | 12 |
+| mpv: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.382 [0.18–0.70] | 0.000 [0.00–0.00] (low n=2) | 0.600 [0.00–0.91] (low n=3) | 0.545 [0.00–0.86] (low n=7) | – | 12 |
 | pydantic: rules (infra patterns, flaky keywords, else train majority) (Gemini's incidents) | 1.000 [1.00–1.00] | – | – | 1.000 [1.00–1.00] (low n=12) | – | 12 |
 | pydantic: BM25 kNN (k=5, majority vote) (Gemini's incidents) | 1.000 [1.00–1.00] | – | – | 1.000 [1.00–1.00] (low n=12) | 1.000 (n=9) | 12 |
-| pydantic: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.667 [0.40–0.86] | – | 0.000 [0.00–0.00] | 0.667 [0.40–0.86] (low n=12) | 1.000 (n=9) | 12 |
+| pydantic: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.667 [0.29–0.91] | – | 0.000 [0.00–0.00] | 0.667 [0.29–0.91] (low n=12) | 1.000 (n=9) | 12 |
 | pytest: rules (infra patterns, flaky keywords, else train majority) (Gemini's incidents) | 0.871 [0.70–1.00] | 0.667 [0.00–1.00] (low n=1) | 1.000 [1.00–1.00] (low n=1) | 0.947 [0.80–1.00] (low n=10) | – | 12 |
 | pytest: BM25 kNN (k=5, majority vote) (Gemini's incidents) | 0.651 [0.45–1.00] | 0.000 [0.00–0.00] (low n=1) | 1.000 [1.00–1.00] (low n=1) | 0.952 [0.84–1.00] (low n=10) | 1.000 (n=4) | 12 |
-| pytest: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.741 [0.59–1.00] | 0.667 [0.00–1.00] (low n=1) | 0.667 [0.00–1.00] (low n=1) | 0.889 [0.71–1.00] (low n=10) | 1.000 (n=4) | 12 |
+| pytest: gemini-3.5-flash-lite + RAG (BM25 top-5), prompt v1, stratified sample | 0.741 [0.58–1.00] | 0.667 [0.00–1.00] (low n=1) | 0.667 [0.00–1.00] (low n=1) | 0.889 [0.67–1.00] (low n=10) | 1.000 (n=4) | 12 |
 
 Retrieval is temporal: BM25 only returns train incidents older than the test incident (no cross-repo future leak), and hit@5 only counts such older train incidents.
 hit@5: a retrieved train incident has the same fix commit or the same job + normalized first error line; computed only on test incidents with at least one such train incident (n in parentheses).
