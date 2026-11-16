@@ -13,9 +13,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runs", type=Path, default=ROOT / "eval/teacher_runs")
     ap.add_argument("--out", type=Path, default=ROOT / "eval/teacher_comparison.md")
+    ap.add_argument("--dropped", nargs="*", default=[], help="'model: reason' rows for configurations not run")
+    ap.add_argument("--chosen", default="", help="note naming the chosen teacher")
     args = ap.parse_args()
 
-    runs = [json.loads(f.read_text()) for f in sorted(args.runs.glob("*.json"))]
+    runs = []
+    for f in sorted(args.runs.glob("*.json")):
+        r = json.loads(f.read_text())
+        r["requested"] = int(f.stem.rsplit("_", 1)[1])  # files are <model>_<prompt>_<n>.json
+        runs.append(r)
     runs.sort(key=lambda r: (-r["n"], r["model"], r["prompt"]))
 
     def ci(r: dict, k: str) -> str:
@@ -41,9 +47,15 @@ def main() -> None:
     ]
     for r in runs:
         lines.append(
-            f"| {r['model']} | {r['prompt']} | {r['n']} | {ci(r, 'macro')} | {ci(r, 'flaky')} "
+            f"| {r['model']} | {r['prompt']} | {r['n']}"
+            + (f" of {r['requested']} (partial: daily quota)" if r["n"] < r["requested"] else "")
+            + f" | {ci(r, 'macro')} | {ci(r, 'flaky')} "
             f"| {r['knn_same']['macro']:.3f} / {r['knn_same']['flaky']:.3f} | {diff(r, 'all', 'macro')} "
             f"| {diff(r, 'all', 'flaky')} | {diff(r, 'fix_relevant=true only', 'macro')} |")
+    lines += [f"| {d.split(':', 1)[0]} | v1, v2 | – | dropped: {d.split(':', 1)[1].strip()} | | | | | |"
+              for d in args.dropped]
+    if args.chosen:
+        lines += ["", f"**Chosen teacher: {args.chosen}**"]
     lines += ["", "Raw answer counts: " + "; ".join(
         f"{r['model']} {r['prompt']} n={r['n']}: " + ", ".join(f"{k} {v}" for k, v in sorted(r["raw"].items()))
         for r in runs)]
