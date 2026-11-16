@@ -93,6 +93,7 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--teacher", type=Path, default=ROOT / "data/processed/teacher_train.jsonl")
     ap.add_argument("--exclude-repos", nargs="*", default=["pytorch/pytorch"])
+    ap.add_argument("--rationalized-path", type=Path, default=ROOT / "data/processed/teacher_rationalized.jsonl")
     ap.add_argument("--with-rationalized", action="store_true",
                     help="rationale target: also train on rationalized answers (data/processed/teacher_rationalized.jsonl)")
     ap.add_argument("--epochs", type=float, default=2)
@@ -127,7 +128,7 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.model)
     tr, va = examples(args.target, args.teacher, set(args.exclude_repos), tok, args.max_len - 64,
-                      ROOT / "data/processed/teacher_rationalized.jsonl" if args.with_rationalized else None)
+                      args.rationalized_path if args.with_rationalized else None)
     tr_os = oversample(tr, args.min_class_frac) if args.min_class_frac > 0 else tr
     print(f"train {len(tr)} ({dict(Counter(r['y'] for r in tr))}) -> oversampled {len(tr_os)} "
           f"({dict(Counter(r['y'] for r in tr_os))}); val {len(va)} ({dict(Counter(r['y'] for r in va))})",

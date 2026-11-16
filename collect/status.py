@@ -89,7 +89,16 @@ def distill_rows(data: Path) -> None:
     if main_done or rat_pts:
         rs = "done" if "TEACHER DATA COMPLETE" in tl else (f"paused: daily quota, resumes {paused}" if paused else "")
         print(bar("distill: rationalization", rat_pts, rs))
-    for name in ("labels", "rationale", "rationale_rationalized"):
+    t38 = data / "teacher_data_38.log"
+    if t38.exists():
+        tl38 = read(t38)
+        print(bar("distill: teacher data (3.8-flash)", progress(t38),
+                  "done" if "TEACHER DATA COMPLETE" in tl38 else "STOPPED (budget cap)" if "budget cap" in tl38 else ""))
+    up = read(data / "teacher_upgrade.log")
+    if up:
+        print(f"{'distill: 3.8-flash upgrade':34} " + (up.strip().splitlines()[-1][:110]))
+    for name in ("labels", "rationale", "rationale_rationalized", "rationale_flash38", "rationale_rationalized_flash38",
+                 "rationale_mixed38", "rationale_rationalized_mixed38"):
         log = data / f"models/student_{name}/train.log"
         if log.exists():
             st = read(log)

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from collect.github_logs import ROOT
+from eval.student_results import paired
 
 
 def main() -> None:
@@ -42,22 +43,33 @@ def main() -> None:
         "* = CI excludes 0. v1 = original prompt; v2 = label-procedure definitions + 3 worked examples from train.",
         "",
         "| model | prompt | n | macro-F1 | flaky F1 | kNN macro / flaky (same n) | paired Δ macro | paired Δ flaky "
-        "| paired Δ macro, fix_relevant=true |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| paired Δ macro, fix_relevant=true | paired Δ macro / flaky vs flash-lite v1 |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
+    def vs_lite(r: dict) -> str:
+        base = next((b for b in runs if b["model"] == "gemini-3.5-flash-lite" and b["prompt"] == "v1"
+                     and b["requested"] == r["requested"] and "preds" in b), None)
+        if not base or base is r or "preds" not in r:
+            return "–"
+        ids = sorted(set(r["preds"]) & set(base["preds"]))
+        d = paired([r["gold"][i] for i in ids], [r["preds"][i] for i in ids], [base["preds"][i] for i in ids])
+        f = lambda t: f"{t[0]:+.3f} [{t[1]:+.2f}, {t[2]:+.2f}]" + (" *" if t[1] > 0 or t[2] < 0 else "")  # noqa: E731
+        return f"{f(d['macro'])} / {f(d['flaky'])} (n={len(ids)})"
+
     for r in runs:
         lines.append(
             f"| {r['model']} | {r['prompt']} | {r['n']}"
             + (f" of {r['requested']} (partial: daily quota)" if r["n"] < r["requested"] else "")
             + f" | {ci(r, 'macro')} | {ci(r, 'flaky')} "
             f"| {r['knn_same']['macro']:.3f} / {r['knn_same']['flaky']:.3f} | {diff(r, 'all', 'macro')} "
-            f"| {diff(r, 'all', 'flaky')} | {diff(r, 'fix_relevant=true only', 'macro')} |")
-    lines += [f"| {d.split(':', 1)[0]} | v1, v2 | – | dropped: {d.split(':', 1)[1].strip()} | | | | | |"
+            f"| {diff(r, 'all', 'flaky')} | {diff(r, 'fix_relevant=true only', 'macro')} | {vs_lite(r)} |")
+    lines += [f"| {d.split(':', 1)[0]} | v1, v2 | – | dropped: {d.split(':', 1)[1].strip()} | | | | | | |"
               for d in args.dropped]
     if args.chosen:
         lines += ["", f"**Chosen teacher: {args.chosen}**"]
     lines += ["", "Raw answer counts: " + "; ".join(
-        f"{r['model']} {r['prompt']} n={r['n']}: " + ", ".join(f"{k} {v}" for k, v in sorted(r["raw"].items()))
+        f"{r['model']} {r['prompt']} n={r['n']}" + (f" thinking={r['thinking']}" if r.get("thinking") else "")
+        + ": " + ", ".join(f"{k} {v}" for k, v in sorted(r["raw"].items()))
         for r in runs)]
     args.out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))

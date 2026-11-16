@@ -13,7 +13,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from datetime import timedelta
 from pathlib import Path
@@ -237,44 +239,150 @@ def load_split(inp: Path, exclude: set[str], test_frac: float, gap_days: int, ma
     return train, test
 
 
-def cache_path(prompt: str, model: str) -> Path:
-    return LLM_CACHE / (hashlib.sha1(f"{model}\n{prompt}".encode()).hexdigest() + ".json")
+SPEND_LOG = ROOT / "data/raw/gemini_spend.jsonl"  # one line per new (uncached) response: model + token usage
 
 
-def gemini(prompt: str, model: str, min_interval: float, state: dict) -> dict | None:
-    f = cache_path(prompt, model)
+def spend(model: str, price_in: float, price_out: float) -> tuple[float, int]:
+    """($ spent on model at the given $/1M prices, number of billed responses), from the ledger."""
+    if not SPEND_LOG.exists():
+        return 0.0, 0
+    rs = [r for r in map(json.loads, SPEND_LOG.open()) if r["model"] == model]
+    return sum(r["in"] * price_in + r["out"] * price_out for r in rs) / 1e6, len(rs)
+
+
+def cache_key_model(model: str, thinking: dict | None) -> str:
+    return model if thinking is None else f"{model}|thinking={json.dumps(thinking, sort_keys=True)}"
+
+
+def cache_path(prompt: str, model: str, thinking: dict | None = None) -> Path:
+    key = cache_key_model(model, thinking)
+    return LLM_CACHE / (hashlib.sha1(f"{key}\n{prompt}".encode()).hexdigest() + ".json")
+
+
+GEMINI_LOCK = threading.Lock()  # guards state (throttle, counters, budget) and the spend ledger file
+
+
+def _budget_reserve(state: dict, model: str) -> bool:
+    """Admit one more request if spent + in-flight estimate + this request stays within the cap (thread-safe).
+    state["cap"] = (dollars, price_in, price_out); spent is loaded once from the ledger, then tracked in memory."""
+    if not state.get("cap"):
+        return True
+    cap, p_in, p_out = state["cap"]
+    with GEMINI_LOCK:
+        if "spent" not in state:
+            state["spent"], state["n_billed"] = spend(model, p_in, p_out)
+            state["inflight"] = 0
+        est = state["spent"] / state["n_billed"] if state["n_billed"] else 0.01
+        if state.get("budget") or state["spent"] + (state["inflight"] + 1) * est > cap:
+            if not state.get("budget"):
+                print(f"  budget cap ${cap} reached for {model}: spent ${state['spent']:.3f} over "
+                      f"{state['n_billed']} responses, {state['inflight']} in flight", file=sys.stderr, flush=True)
+            state["budget"] = True
+            return False
+        state["inflight"] += 1
+        return True
+
+
+def _budget_settle(state: dict, usage: dict | None) -> None:
+    if not state.get("cap"):
+        return
+    _, p_in, p_out = state["cap"]
+    with GEMINI_LOCK:
+        state["inflight"] -= 1
+        if usage is not None:
+            state["spent"] += (usage["in"] * p_in + usage["out"] * p_out) / 1e6
+            state["n_billed"] += 1
+
+
+def gemini(prompt: str, model: str, min_interval: float, state: dict, thinking: dict | None = None) -> dict | None:
+    """Cached, throttled, thread-safe Gemini call. min_interval spaces request starts across all threads.
+    Returns None on daily quota (state["quota"]), budget cap (state["budget"]) or persistent errors.
+    Cache writes are atomic (per-thread tmp file + rename)."""
+    f = cache_path(prompt, model, thinking)
     if f.exists():
         return json.loads(f.read_text())
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}  # thinkingConfig: 400 on flash-lite
-    for attempt in range(6):
-        wait = state.get("last", 0) + min_interval - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        state["last"] = time.time()
-        try:
-            r = requests.post(GEMINI_URL.format(model=model), json=body, timeout=60,
-                              headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
-        except requests.RequestException as e:  # includes the 60 s timeout: a hang must not stall the eval
-            print(f"  gemini request failed ({type(e).__name__}); retry", file=sys.stderr)
-            continue
-        if r.status_code == 429:
-            msg = r.text.lower()
-            if "per day" in msg or "perday" in msg:
-                print("  Gemini daily quota exhausted; rerun later to resume from cache", file=sys.stderr)
-                state["quota"] = True
-                return None
-            time.sleep(30 * (attempt + 1))
-            continue
-        if r.status_code >= 500:
-            time.sleep(10 * (attempt + 1))
-            continue
-        r.raise_for_status()
-        out = r.json()
-        LLM_CACHE.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(out))
-        return out
-    return None
+    if not _budget_reserve(state, model):
+        return None
+    gen = {"temperature": 0, "responseMimeType": "application/json"}  # thinkingConfig: 400 on flash-lite
+    if thinking is not None:
+        gen["thinkingConfig"] = thinking
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
+    usage = None
+    try:
+        for attempt in range(6):
+            with GEMINI_LOCK:  # reserve a start slot: starts are min_interval apart across threads
+                slot = max(time.time(), state.get("last", 0) + min_interval)
+                state["last"] = slot
+            if slot > time.time():
+                time.sleep(slot - time.time())
+            try:
+                r = requests.post(GEMINI_URL.format(model=model), json=body, timeout=60,
+                                  headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
+            except requests.RequestException as e:  # includes the 60 s timeout: a hang must not stall the eval
+                print(f"  gemini request failed ({type(e).__name__}); retry", file=sys.stderr, flush=True)
+                continue
+            if r.status_code == 429:
+                msg = r.text.lower()
+                if "per day" in msg or "perday" in msg:
+                    print("  Gemini daily quota exhausted; rerun later to resume from cache", file=sys.stderr)
+                    state["quota"] = True
+                    return None
+                with GEMINI_LOCK:
+                    state["n429"] = state.get("n429", 0) + 1
+                    n429 = state["n429"]
+                print(f"  {time.strftime('%H:%M:%S')} Gemini 429 (rate limit), this worker backs off "
+                      f"{30 * (attempt + 1)} s [{n429} so far]: {r.text[:160]!r}", file=sys.stderr, flush=True)
+                time.sleep(30 * (attempt + 1))
+                continue
+            if r.status_code >= 500:
+                time.sleep(10 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            out = r.json()
+            LLM_CACHE.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(out))
+            tmp.replace(f)
+            u = out.get("usageMetadata", {})
+            usage = {"in": u.get("promptTokenCount", 0),
+                     "out": u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),
+                     "thoughts": u.get("thoughtsTokenCount", 0)}
+            with GEMINI_LOCK, SPEND_LOG.open("a") as sl:
+                sl.write(json.dumps({"model": model, "thinking": thinking, **usage, "t": time.time()}) + "\n")
+                state["n_api"] = state.get("n_api", 0) + 1  # real (uncached) responses, for concurrency ramp-up
+            return out
+        return None
+    finally:
+        _budget_settle(state, usage)
+
+
+def concurrent_map(fn, items: list, state: dict, workers: int = 8, max_workers: int = 16, raise_after: int = 50):
+    """Yield (item, result) as calls complete, running fn(item) on a thread pool: `workers` concurrent calls,
+    raised to `max_workers` after `raise_after` real API responses (cache hits don't count) with zero 429s. Stops starting new calls once fn
+    returns None for a quota/budget stop (state["quota"] / state["budget"]); already started calls finish.
+    Callers do all writes and progress output in the main thread, from the yielded results."""
+    slots = threading.Semaphore(workers)
+    ctl = {"raised": False}
+
+    def call(item):
+        with slots:
+            if state.get("quota") or state.get("budget"):
+                return item, "skipped"
+            res = fn(item)
+        with GEMINI_LOCK:
+            if not ctl["raised"] and state.get("n_api", 0) >= raise_after and not state.get("n429"):
+                ctl["raised"] = True
+                for _ in range(max_workers - workers):
+                    slots.release()
+                print(f"  {time.strftime('%H:%M:%S')} zero 429s after {raise_after} requests: concurrency "
+                      f"{workers} -> {max_workers}", file=sys.stderr, flush=True)
+        return item, res
+
+    with ThreadPoolExecutor(max_workers) as ex:
+        for fut in as_completed([ex.submit(call, it) for it in items]):
+            item, res = fut.result()
+            if res != "skipped":
+                yield item, res
 
 
 def parse_answer(resp: dict | None) -> tuple[str, str] | None:
@@ -367,6 +475,13 @@ def main() -> None:
     ap.add_argument("--prompt", choices=["v1", "v2"], default="v1",
                     help="v1: original; v2: label-procedure definitions + 3 worked examples from train")
     ap.add_argument("--summary-json", type=Path, help="write headline numbers (for teacher comparison tables)")
+    ap.add_argument("--thinking", type=json.loads, help='thinkingConfig JSON, e.g. \'{"thinkingLevel": "minimal"}\'')
+    ap.add_argument("--budget-cap", type=float, help="stop new requests when spend on --model would exceed this ($)")
+    ap.add_argument("--workers", type=int, default=8, help="concurrent Gemini calls (raised to --max-workers "
+                                                           "after 50 requests with zero 429s)")
+    ap.add_argument("--max-workers", type=int, default=16)
+    ap.add_argument("--cap-prices", type=float, nargs=2, default=[0.83, 4.13],
+                    help="$/1M input, output used to enforce --budget-cap (use the highest listed price)")
     args = ap.parse_args()
     exclude = set(args.exclude_repos)
 
@@ -407,26 +522,31 @@ def main() -> None:
     if os.environ.get("GEMINI_API_KEY") or args.cache_only:
         idx = (stratified(test, args.llm_n) if args.llm_sample == "stratified"
                else sorted(random.Random(0).sample(range(len(test)), min(args.llm_n, len(test)))))
-        state: dict = {}
+        state: dict = {"cap": (args.budget_cap, *args.cap_prices)} if args.budget_cap else {}
         failed = missing = 0
         examples = worked_examples(train) if args.prompt == "v2" else ""
         print(f"{time.strftime('%H:%M:%S')} gemini 0/{len(idx)}", file=sys.stderr, flush=True)
-        for n, j in enumerate(idx, 1):
-            q = test[j]
-            prompt = build_prompt(q, train, hits[j], args.prompt, examples)
-            if args.cache_only and not cache_path(prompt, args.model).exists():
-                missing += 1
-                continue
-            resp = gemini(prompt, args.model, args.min_interval, state)
-            if resp is None:  # daily quota or persistent errors: stop, report what we have (rerun resumes)
-                break
-            a = parse_answer(resp)
+        prompts = {j: build_prompt(test[j], train, hits[j], args.prompt, examples) for j in idx}
+        todo = [j for j in idx if not args.cache_only or cache_path(prompts[j], args.model, args.thinking).exists()]
+        missing = len(idx) - len(todo)
+        n = 0
+        call = lambda j: gemini(prompts[j], args.model, args.min_interval, state, args.thinking)  # noqa: E731
+        for j, resp in concurrent_map(call, todo, state, args.workers, args.max_workers):
+            n += 1  # answers keyed by incident: completion order does not affect results
+            if resp is None and (state.get("quota") or state.get("budget")):
+                continue  # not run (refused by quota / budget), not an unparseable answer
+            a = parse_answer(resp) if resp is not None else None
             if a is None:
                 failed += 1
             else:
                 answers[j] = a
-            if n % 5 == 0 or n == len(idx):
+            if n % 5 == 0 or n == len(todo):
                 print(f"{time.strftime('%H:%M:%S')} gemini {n}/{len(idx)}", file=sys.stderr, flush=True)
+        if state.get("quota") or state.get("budget"):
+            print(f"  stopped early ({'daily quota' if state.get('quota') else 'budget cap'}): "
+                  f"{len(answers)}/{len(idx)} answered", file=sys.stderr, flush=True)
+        if state.get("n429"):
+            print(f"  {state['n429']} rate-limit (429) responses during this run", file=sys.stderr, flush=True)
         preds["llm"] = {j: SCORE_MAP.get(c, c) for j, (c, _) in answers.items()}
         names["llm"] = f"{args.model} + RAG (BM25 top-{args.k}), prompt {args.prompt}, {args.llm_sample} sample"
         raw = Counter(c for c, _ in answers.values())
@@ -558,7 +678,9 @@ def main() -> None:
             "model": args.model, "prompt": args.prompt, "n": len(js),
             "llm": f1s(g, [preds["llm"][j] for j in js]), "knn_same": f1s(g, [preds["knn"][j] for j in js]),
             "llm_ci": bootstrap_ci(g, [preds["llm"][j] for j in js], args.bootstrap) if args.bootstrap else {},
-            "paired": paired_res, "raw": dict(Counter(c for c, _ in answers.values()))}, indent=1))
+            "paired": paired_res, "raw": dict(Counter(c for c, _ in answers.values())),
+            "thinking": args.thinking, "preds": {test[j]["id"]: preds["llm"][j] for j in js},
+            "gold": {test[j]["id"]: test[j]["y"] for j in js}}, indent=1))
     print("\n".join(lines))
 
     if args.disagreements:

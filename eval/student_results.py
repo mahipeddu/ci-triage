@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--teacher-model", default="gemini-3.5-flash-lite")
     ap.add_argument("--llm-n", type=int, default=150)
     ap.add_argument("--out", type=Path, default=ROOT / "eval/student_results.md")
+    ap.add_argument("--price-in", type=float, default=0.30, help="teacher $ per 1M input tokens (paid tier)")
+    ap.add_argument("--price-out", type=float, default=2.50, help="teacher $ per 1M output tokens (paid tier)")
     args = ap.parse_args()
 
     train, test = load_split(ROOT / "data/processed/failures_labeled.jsonl", {"pytorch/pytorch"}, 0.3, 3)
@@ -52,12 +54,15 @@ def main() -> None:
     hits = {j: search(test[j]["text"], 5, before=test[j]["t"]) for j in idx}
     gold = {j: test[j]["y"] for j in idx}
     preds = {"BM25 kNN": {j: knn_predict(hits[j], train, majority) for j in idx}}
-    teacher = {}
+    teacher, usage = {}, []
     for j in idx:
         f = cache_path(build_prompt(test[j], train, hits[j]), args.teacher_model)
-        a = parse_answer(json.loads(f.read_text())) if f.exists() else None
+        resp = json.loads(f.read_text()) if f.exists() else None
+        a = parse_answer(resp) if resp else None
         if a:
             teacher[j] = SCORE_MAP.get(a[0], a[0])
+            u = resp.get("usageMetadata", {})
+            usage.append((u.get("promptTokenCount", 0), u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0)))
     preds[f"teacher {args.teacher_model} v1"] = teacher
     by_id = {test[j]["id"]: j for j in idx}
     students, lat = {}, {}
@@ -128,9 +133,14 @@ def main() -> None:
         lines.append(f"| student {sname} (RTX 5080, 4-bit) | {st.median(score):.2f} s category scoring"
                      + (f"; {st.median(gen):.2f} s with generated likely_cause" if gen else "")
                      + " | $0 API (local GPU) |")
-    lines += [f"| teacher {args.teacher_model} | not measured here (free-tier latency varied 2–100 s per request "
-              "during these runs) | $0 on the free tier, but capped by the daily quota (a few hundred requests/day "
-              "observed); paid-tier price not assumed |", ""]
+    tin, tout = st.mean(u[0] for u in usage), st.mean(u[1] for u in usage)
+    cost = 1000 * (tin * args.price_in + tout * args.price_out) / 1e6
+    lines += [f"| teacher {args.teacher_model} | not measured here (free-tier latency varied 2–100 s per request; "
+              f"paid tier ~1 request/s sustained) | ${cost:.2f} on the paid tier (mean {tin:.0f} input + {tout:.0f} "
+              f"output tokens per incident at ${args.price_in}/M in, ${args.price_out}/M out); $0 on the free tier "
+              "within its daily quota |", "",
+              "Teacher prices: third-party aggregators citing Google's rate sheet (Oct 2026); verify against "
+              "ai.google.dev/gemini-api/docs/pricing.", ""]
     args.out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
